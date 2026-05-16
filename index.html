@@ -2883,6 +2883,17 @@ const VOICE_CONFIG = {
   // Enable voice control (false = helemaal uit, alleen typen)
   enabled: true,
 
+  // Drempel voor audio-piek tijdens opname (0..1). Als de maximale amplitude
+  // tijdens de hele opname onder deze waarde blijft, wordt de blob NIET naar
+  // Whisper gestuurd — dit voorkomt hallucinaties uit stilte. Verhoog als je
+  // nog hallucinaties krijgt; verlaag als zachte spraak wordt geweigerd.
+  silenceThreshold: 0.06,
+
+  // Minimum opnameduur (ms) en blob-grootte (bytes). Filtert onbedoelde
+  // korte spatiebalk-aanrakingen uit.
+  minRecordingMs: 800,
+  minBlobBytes: 3000,
+
   // Aanvullende jargon-hints (scenario-specifieke termen worden automatisch toegevoegd)
   basePrompt: 'OIP, VRU, vapour recovery, absorber, adsorber, LMRA, P&ID, MOC, ' +
               'tankterminal, EVOS, Shell, Liquin, ATEX, emergency response, ERS, ' +
@@ -2915,6 +2926,11 @@ class InlineVoiceInput {
     this.onTranscript = opts.onTranscript;
     this.onError = opts.onError;
     this.skipPromptEchoCheck = !!opts.skipPromptEchoCheck;
+    // Drempelwaarden — uit VOICE_CONFIG met fallbacks. Audio-piek onder
+    // silenceThreshold => opname wordt afgewezen (anti-hallucinatie).
+    this.silenceThreshold = opts.silenceThreshold ?? 0.06;
+    this.minRecordingMs = opts.minRecordingMs ?? 800;
+    this.minBlobBytes = opts.minBlobBytes ?? 3000;
     this.state = 'idle';
     this.stream = null;
     this.mediaRecorder = null;
@@ -2923,6 +2939,7 @@ class InlineVoiceInput {
     this.analyser = null;
     this.levelTimer = null;
     this.recordStartTs = 0;
+    this.maxLevelDuringRecording = 0;
   }
 
   setLanguage(l) { if (l) this.language = l; }
@@ -2930,6 +2947,7 @@ class InlineVoiceInput {
 
   async start() {
     if (this.state !== 'idle') return;
+    this.maxLevelDuringRecording = 0;
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -3020,16 +3038,32 @@ class InlineVoiceInput {
   async _onStop() {
     this._stopLevelMonitor();
     const duration = Date.now() - this.recordStartTs;
+    const maxLevel = this.maxLevelDuringRecording;
     const blobType = this.chunks[0]?.type || this.mediaRecorder?.mimeType || 'audio/webm';
     const blob = new Blob(this.chunks, { type: blobType });
     this.chunks = [];
     this._cleanup();
 
-    if (duration < 500 || blob.size < 1500) {
-      console.log('[OIP voice] Recording too short, ignoring (dur=' + duration + 'ms, size=' + blob.size + ')');
+    // Filter 1: te korte opname (waarschijnlijk per ongeluk PTT aangetikt)
+    if (duration < this.minRecordingMs || blob.size < this.minBlobBytes) {
+      console.log('[OIP voice] Recording too short, ignoring (dur=' + duration +
+                  'ms, size=' + blob.size + ', minDur=' + this.minRecordingMs +
+                  ', minSize=' + this.minBlobBytes + ')');
       this._setState('idle');
       return;
     }
+
+    // Filter 2: te zachte opname → hallucinatie-magneet, NIET naar Whisper sturen.
+    // De piek bleef onder de drempel = geen herkenbare spraak in de opname.
+    if (maxLevel < this.silenceThreshold) {
+      console.log('[OIP voice] Recording too quiet (maxLevel=' + maxLevel.toFixed(3) +
+                  ' < ' + this.silenceThreshold + '), ignoring to prevent hallucination.');
+      this._setState('idle');
+      return;
+    }
+
+    console.log('[OIP voice] Recording OK (dur=' + duration + 'ms, size=' + blob.size +
+                ', maxLevel=' + maxLevel.toFixed(3) + ') → sending to Whisper');
 
     this._setState('processing');
     try {
@@ -3056,8 +3090,11 @@ class InlineVoiceInput {
   static _isHallucination(text) {
     if (!text) return true;
     const t = text.trim().toLowerCase();
+    // Heel kort (1-2 letters): vrijwel zeker een taalcode-hallucination zoals "nl", "en", "de"
     if (t.length <= 3) return true;
+    // Bekende stilte-artefacten in meerdere talen + ChatGPT/assistant-residu uit trainingsdata
     const patterns = [
+      // Video-ondertitel-residu (klassieke Whisper-hallucinaties)
       /^bedankt voor (het )?kijken\.?$/,
       /^thanks for watching\.?$/,
       /^thank you( for watching)?\.?$/,
@@ -3066,10 +3103,35 @@ class InlineVoiceInput {
       /^ondertiteld door.*$/,
       /^sous-titres.*$/,
       /^subtítulos.*$/,
+      /^napisy.*$/,
+      // ChatGPT / assistant-style trainingsdata (zien we letterlijk in console!)
+      /^chatgpt[,\s.!?]/,
+      /^hallo,?\s+hoe kan ik (u|je|jullie) helpen[?.]?$/,
+      /^hoe kan ik (u|je|jou|jullie) helpen[?.]?$/,
+      /^hallo iedereen[!?.]?$/,
+      /^hello (everyone|there)[!?.]?$/,
+      /^hi (there|everyone)[!?.]?$/,
+      /^how can I (assist|help) you( today)?[?.]?$/,
+      /^how may I (assist|help) you( today)?[?.]?$/,
+      /^i'?m here to help[!?.]?$/,
+      /^how are you( today)?[?.]?$/,
+      // Music/sound tags
+      /^\[?(music|musique|musik|música|muziek)\]?\.?$/,
+      /^♪+$/,
+      /^\(music\)\.?$/,
+      // Generieke korte erkenningen die opvallend vaak verschijnen bij stilte
+      /^ja,?\s+ik begrijp het\.?$/,
+      /^yes,?\s+i understand\.?$/,
+      /^ok(ay)?\.?$/,
+      /^uh[\s\-]?huh\.?$/,
+      /^mm[\s\-]?hmm\.?$/,
+      // Rest-residu
       /^\.+$/,
       /^you\.?$/,
       /^hi\.?$/,
       /^bye\.?$/,
+      /^tschüss\.?$/,
+      /^vielen dank\.?$/,
     ];
     return patterns.some(rx => rx.test(t));
   }
@@ -3221,6 +3283,8 @@ class InlineVoiceInput {
         const v = Math.abs(buf[i] - 128) / 128;
         if (v > peak) peak = v;
       }
+      // Bewaar hoogste piek over hele opname — voor stilte-detectie in _onStop
+      if (peak > this.maxLevelDuringRecording) this.maxLevelDuringRecording = peak;
       this.onLevel?.(peak);
       this.levelTimer = requestAnimationFrame(tick);
     };
@@ -3303,6 +3367,9 @@ async function initVoiceInput() {
       endpoint: `${VOICE_CONFIG.baseUrl.replace(/\/$/, '')}/api/transcribe`,
       language: getEffectiveLang(),
       prompt: buildVoicePrompt(),
+      silenceThreshold: VOICE_CONFIG.silenceThreshold,
+      minRecordingMs: VOICE_CONFIG.minRecordingMs,
+      minBlobBytes: VOICE_CONFIG.minBlobBytes,
       audioLevelCallback: updateVoiceMeter,
       onStateChange: handleVoiceStateChange,
       onTranscript: handleVoiceTranscript,
@@ -3556,6 +3623,9 @@ function runRadioCheck() {
       language: effL,
       prompt: T.sentence + ' ' + (VOICE_CONFIG.basePrompt || ''),
       skipPromptEchoCheck: true,
+      silenceThreshold: VOICE_CONFIG.silenceThreshold,
+      minRecordingMs: VOICE_CONFIG.minRecordingMs,
+      minBlobBytes: VOICE_CONFIG.minBlobBytes,
       audioLevelCallback: lvl => {
         if (!meter) return;
         const bars = meter.children;
@@ -3801,11 +3871,28 @@ function onPttKeyDown(e) {
   if (btn?.disabled) return;
   if (e.ctrlKey || e.altKey || e.metaKey) return;
 
-  const tag = (e.target?.tagName || '').toUpperCase();
-  if (tag === 'TEXTAREA' || tag === 'INPUT') {
-    const val = (e.target.value || '');
+  const target = e.target;
+  const tag = (target?.tagName || '').toUpperCase();
+
+  // STRIKTE PTT-TRIGGER (v14): voorkom onbedoelde opnames wanneer focus op een
+  // knop, tab, link of dropdown staat — anders activeert spatie de PTT in plaats
+  // van de knop, waarna Whisper hallucinaties produceert uit de stille opname.
+  //
+  // Blokkeren: BUTTON, A, SELECT, OPTION, INPUT, contenteditable, role="button".
+  // Toestaan: BODY, lege TEXTAREA, DIV/SPAN zonder interactiviteit.
+  if (tag === 'BUTTON' || tag === 'A' || tag === 'SELECT' || tag === 'OPTION' || tag === 'INPUT') {
+    return;
+  }
+  if (target?.isContentEditable) return;
+  if (target?.getAttribute && (target.getAttribute('role') === 'button' || target.getAttribute('role') === 'tab')) return;
+
+  if (tag === 'TEXTAREA') {
+    // In het tekstveld: spatiebalk-PTT alléén als het veld leeg is.
+    // Zodra de operator iets heeft getypt, gedraagt spatiebalk zich weer normaal.
+    const val = (target.value || '');
     if (val.length > 0) return;
   }
+
   // Niet activeren tijdens modals (LMRA, debrief, etc.)
   if (document.querySelector('.modal-backdrop.active')) return;
 
