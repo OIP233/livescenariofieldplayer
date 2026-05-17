@@ -2899,6 +2899,25 @@ const VOICE_CONFIG = {
   minRecordingMs: 800,
   minBlobBytes: 3000,
 
+  // v16: Mic-stream-processing.
+  // - echoCancellation: true zorgt voor verstoring met ambient-geluiden (de
+  //   browser probeert de speaker-uitvoer uit de mic te subtraheren maar
+  //   raakt out-of-sync bij fase-overgangen, wat hallucinaties veroorzaakt).
+  // - noiseSuppression: laten we ook uit; Whisper handelt ruis robuust af
+  //   en NS kan zachte spraak mangelen.
+  // - autoGainControl: blijft uit; AGC veroorzaakt onvoorspelbare niveaus.
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+
+  // v16: Ambient muten tijdens opname. Als een echte portofoon: bij PTT-indrukken
+  // wordt de speaker-output kort op 0 gezet via een smooth gain-ramp, zodat de
+  // mic NOOIT scenario-ambient hoort. Voorkomt vermenging en bleed-through.
+  // Zet op false als je de ambient liefst doorlopend hoort tijdens opname.
+  muteAmbientWhileRecording: true,
+  ambientFadeMs: 80,                 // duur van de fade-down/up
+  ambientFadedGain: 0.0,              // 0 = stilte; 0.1 = zachter maar hoorbaar
+
   // Aanvullende jargon-hints (scenario-specifieke termen worden automatisch toegevoegd)
   basePrompt: 'OIP, VRU, vapour recovery, absorber, adsorber, LMRA, P&ID, MOC, ' +
               'tankterminal, EVOS, Shell, Liquin, ATEX, emergency response, ERS, ' +
@@ -3011,12 +3030,23 @@ class InlineVoiceInput {
     this.silenceThreshold = opts.silenceThreshold ?? 0.06;
     this.minRecordingMs = opts.minRecordingMs ?? 800;
     this.minBlobBytes = opts.minBlobBytes ?? 3000;
+    // v16: mic-stream-processing opties (default: alles uit, ruwe audio)
+    this.echoCancellation = opts.echoCancellation ?? false;
+    this.noiseSuppression = opts.noiseSuppression ?? false;
+    this.autoGainControl = opts.autoGainControl ?? false;
+    // v16: ambient-mute callbacks — wordt aangeroepen vlak voor opname start
+    // en vlak na stop, zodat de scenario-ambient gemute kan worden.
+    this.onWillRecord = opts.onWillRecord;
+    this.onDidRecord  = opts.onDidRecord;
     this.state = 'idle';
     this.stream = null;
     this.mediaRecorder = null;
     this.chunks = [];
+    // v16: PERSISTENTE AudioContext (i.p.v. nieuwe per opname).
+    // Elimineert AudioContext-leaks die de scenario-ambient verstoorden.
     this.audioCtx = null;
     this.analyser = null;
+    this.streamSource = null;
     this.levelTimer = null;
     this.recordStartTs = 0;
     this.maxLevelDuringRecording = 0;
@@ -3028,16 +3058,24 @@ class InlineVoiceInput {
   async start() {
     if (this.state !== 'idle') return;
     this.maxLevelDuringRecording = 0;
+
+    // v16: ambient muten VOORDAT we de mic openen — zodat AEC nooit met
+    // ambient hoeft te concurreren, zelfs als de browser AEC alsnog toepast.
+    try { this.onWillRecord?.(); } catch (e) { console.warn('[OIP voice] onWillRecord failed:', e); }
+
     try {
+      // v16: mic-constraints uit config (default: alles uit voor schone Whisper-input)
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false,
+          echoCancellation: this.echoCancellation,
+          noiseSuppression: this.noiseSuppression,
+          autoGainControl: this.autoGainControl,
           sampleRate: 16000,
           channelCount: 1,
         }
       });
+      console.log('[OIP voice] Mic constraints: AEC=' + this.echoCancellation +
+                  ', NS=' + this.noiseSuppression + ', AGC=' + this.autoGainControl);
 
       const candidates = [
         'audio/webm;codecs=opus',
@@ -3072,13 +3110,25 @@ class InlineVoiceInput {
       this.mediaRecorder.start(250);
 
       try {
-        const Ctx = window.AudioContext || window.webkitAudioContext;
-        this.audioCtx = new Ctx();
-        const src = this.audioCtx.createMediaStreamSource(this.stream);
+        // v16: hergebruik dezelfde AudioContext over alle opnames. Voorkomt
+        // dat we per recording een nieuwe context aanmaken (browsers limieten
+        // op ~6 contexts; oude contexts die niet snel closen veroorzaken
+        // resource-druk die de scenario-ambient kon laten haperen).
+        if (!this.audioCtx || this.audioCtx.state === 'closed') {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          this.audioCtx = new Ctx();
+          console.log('[OIP voice] Created persistent AudioContext (sampleRate=' +
+                      this.audioCtx.sampleRate + ')');
+        }
+        // Sommige browsers suspenden de context na inactiviteit
+        if (this.audioCtx.state === 'suspended') {
+          await this.audioCtx.resume();
+        }
+        this.streamSource = this.audioCtx.createMediaStreamSource(this.stream);
         this.analyser = this.audioCtx.createAnalyser();
         this.analyser.fftSize = 512;
         this.analyser.smoothingTimeConstant = 0.5;
-        src.connect(this.analyser);
+        this.streamSource.connect(this.analyser);
         this._startLevelMonitor();
       } catch (e) {
         console.warn('[OIP voice] Audio metering setup failed (non-fatal):', e);
@@ -3381,12 +3431,31 @@ class InlineVoiceInput {
       this.stream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
       this.stream = null;
     }
-    if (this.audioCtx) {
-      try { this.audioCtx.close(); } catch (e) {}
-      this.audioCtx = null;
+    // v16: AudioContext NIET sluiten — wordt hergebruikt over alle opnames.
+    // Wel de stream-bron en analyser disconnecten zodat ze opgeruimd worden.
+    if (this.streamSource) {
+      try { this.streamSource.disconnect(); } catch (e) {}
+      this.streamSource = null;
     }
-    this.analyser = null;
+    if (this.analyser) {
+      try { this.analyser.disconnect(); } catch (e) {}
+      this.analyser = null;
+    }
     this.mediaRecorder = null;
+
+    // v16: ambient terugzetten ná opname (de daadwerkelijke "stop opname" is
+    // hier het meest betrouwbare moment).
+    try { this.onDidRecord?.(); } catch (e) { console.warn('[OIP voice] onDidRecord failed:', e); }
+  }
+
+  // v16: expliciete shutdown — voor pagina-unload of teardown.
+  // Sluit de persistente AudioContext definitief.
+  async shutdown() {
+    this._cleanup();
+    if (this.audioCtx && this.audioCtx.state !== 'closed') {
+      try { await this.audioCtx.close(); } catch (e) {}
+    }
+    this.audioCtx = null;
   }
 
   _setState(s) {
@@ -3450,6 +3519,13 @@ async function initVoiceInput() {
       silenceThreshold: getCalibratedThreshold(),
       minRecordingMs: VOICE_CONFIG.minRecordingMs,
       minBlobBytes: VOICE_CONFIG.minBlobBytes,
+      // v16: mic-stream-processing uit voor schone Whisper-input + minder interferentie met ambient
+      echoCancellation: VOICE_CONFIG.echoCancellation,
+      noiseSuppression: VOICE_CONFIG.noiseSuppression,
+      autoGainControl: VOICE_CONFIG.autoGainControl,
+      // v16: ambient muten tijdens opname (alleen als config dat zegt)
+      onWillRecord: VOICE_CONFIG.muteAmbientWhileRecording ? audioMuteForRecording : null,
+      onDidRecord:  VOICE_CONFIG.muteAmbientWhileRecording ? audioRestoreAfterRecording : null,
       audioLevelCallback: updateVoiceMeter,
       onStateChange: handleVoiceStateChange,
       onTranscript: handleVoiceTranscript,
@@ -3706,6 +3782,13 @@ function runRadioCheck() {
       silenceThreshold: VOICE_CONFIG.silenceThreshold,
       minRecordingMs: VOICE_CONFIG.minRecordingMs,
       minBlobBytes: VOICE_CONFIG.minBlobBytes,
+      // v16: zelfde mic-stream-processing als operational instance (consistente kalibratie)
+      echoCancellation: VOICE_CONFIG.echoCancellation,
+      noiseSuppression: VOICE_CONFIG.noiseSuppression,
+      autoGainControl: VOICE_CONFIG.autoGainControl,
+      // v16: ook tijdens radiocheck ambient muten (al staat 'ie meestal nog niet aan)
+      onWillRecord: VOICE_CONFIG.muteAmbientWhileRecording ? audioMuteForRecording : null,
+      onDidRecord:  VOICE_CONFIG.muteAmbientWhileRecording ? audioRestoreAfterRecording : null,
       audioLevelCallback: lvl => {
         if (!meter) return;
         const bars = meter.children;
@@ -3855,6 +3938,9 @@ function runRadioCheck() {
       if (checkVoice.state === 'recording') {
         try { checkVoice.cancel(); } catch (_) {}
       }
+      // v16: shutdown van de radiocheck-instance — sluit z'n persistente AudioContext
+      // zodat we niet met twee actieve contexts blijven zitten tijdens het scenario.
+      try { checkVoice.shutdown(); } catch (_) {}
       if (markDone) {
         try { localStorage.setItem('oip-radiocheck-done', '1'); } catch (_) {}
       }
@@ -4215,6 +4301,51 @@ function audioToggle() {
   if (btn) {
     btn.textContent = AUDIO.enabled ? '🔊' : '🔇';
     btn.title = AUDIO.enabled ? 'Geluid aan (klik om uit te schakelen)' : 'Geluid uit (klik om in te schakelen)';
+  }
+}
+
+/* ─── v16: ambient muten tijdens spraakopname ───────────────────
+   Net als een echte portofoon: PTT ingedrukt → speaker dimt → spreken
+   → loslaten → speaker terug. Dit voorkomt dat de microfoon de eigen
+   ambient van het scenario opvangt (wat AEC-interferentie en
+   Whisper-hallucinaties veroorzaakte in eerdere versies).
+   ─────────────────────────────────────────────────────────────── */
+
+// Houdt bij welk gain-niveau actief was voordat we muten — zodat we precies
+// kunnen herstellen, ook als de user tussendoor de audio-toggle gebruikt heeft.
+let AUDIO_AMBIENT_PRE_MUTE_GAIN = null;
+
+function audioMuteForRecording() {
+  if (!AUDIO.initialized || !AUDIO.master || !AUDIO.ctx) return;
+  if (AUDIO_AMBIENT_PRE_MUTE_GAIN !== null) return; // al gemute
+  try {
+    const now = AUDIO.ctx.currentTime;
+    const fadeS = (VOICE_CONFIG.ambientFadeMs ?? 80) / 1000;
+    const targetGain = VOICE_CONFIG.ambientFadedGain ?? 0.0;
+    AUDIO_AMBIENT_PRE_MUTE_GAIN = AUDIO.master.gain.value;
+    AUDIO.master.gain.cancelScheduledValues(now);
+    AUDIO.master.gain.setValueAtTime(AUDIO.master.gain.value, now);
+    AUDIO.master.gain.linearRampToValueAtTime(targetGain, now + fadeS);
+  } catch (e) {
+    console.warn('[OIP voice] audioMuteForRecording failed:', e);
+  }
+}
+
+function audioRestoreAfterRecording() {
+  if (!AUDIO.initialized || !AUDIO.master || !AUDIO.ctx) return;
+  if (AUDIO_AMBIENT_PRE_MUTE_GAIN === null) return; // niets te herstellen
+  try {
+    const now = AUDIO.ctx.currentTime;
+    const fadeS = (VOICE_CONFIG.ambientFadeMs ?? 80) / 1000;
+    // Herstellen naar de huidige gewenste gain: 0.95 als enabled, 0 als uit.
+    // (We respecteren een eventuele wijziging in AUDIO.enabled tijdens opname.)
+    const restoreTo = AUDIO.enabled ? 0.95 : 0.0;
+    AUDIO.master.gain.cancelScheduledValues(now);
+    AUDIO.master.gain.setValueAtTime(AUDIO.master.gain.value, now);
+    AUDIO.master.gain.linearRampToValueAtTime(restoreTo, now + fadeS);
+    AUDIO_AMBIENT_PRE_MUTE_GAIN = null;
+  } catch (e) {
+    console.warn('[OIP voice] audioRestoreAfterRecording failed:', e);
   }
 }
 
