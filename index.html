@@ -4269,7 +4269,15 @@ function syncPttToSendButton() {
 
 const AUDIO = {
   ctx: null,                    // AudioContext (lazy init)
-  master: null,                 // Master gain
+  master: null,                 // Master gain — toggle audio aan/uit
+  // v17: gesplitste sub-busses tussen sources en master.
+  // - ambientGain: continue ambient (wind, hiss, pomp-loop, cavitatie)
+  //   wordt gemute tijdens PTT-opname om mic-interferentie te voorkomen.
+  // - eventGain: korte one-shots (kleppen, pomp-brom, alarmen, scheidingen)
+  //   blijft ALTIJD doorklinken — ook tijdens spreken, want events zijn kort
+  //   en infrequent en geven Whisper niet de moeite waard verstoring.
+  ambientGain: null,
+  eventGain: null,
   enabled: true,                // User toggle
   initialized: false,
   ambientNodes: null,           // Huidige ambient-bron (om te kunnen stoppen)
@@ -4283,6 +4291,16 @@ function audioInit() {
     AUDIO.master = AUDIO.ctx.createGain();
     AUDIO.master.gain.value = AUDIO.enabled ? 0.95 : 0;
     AUDIO.master.connect(AUDIO.ctx.destination);
+
+    // v17: sub-busses voor ambient (mute-baar tijdens opname) en events (altijd door).
+    AUDIO.ambientGain = AUDIO.ctx.createGain();
+    AUDIO.ambientGain.gain.value = 1.0;
+    AUDIO.ambientGain.connect(AUDIO.master);
+
+    AUDIO.eventGain = AUDIO.ctx.createGain();
+    AUDIO.eventGain.gain.value = 1.0;
+    AUDIO.eventGain.connect(AUDIO.master);
+
     AUDIO.initialized = true;
   } catch (e) {
     console.warn('Audio init failed:', e);
@@ -4316,33 +4334,34 @@ function audioToggle() {
 let AUDIO_AMBIENT_PRE_MUTE_GAIN = null;
 
 function audioMuteForRecording() {
-  if (!AUDIO.initialized || !AUDIO.master || !AUDIO.ctx) return;
+  // v17: alleen ambientGain muten; eventGain blijft open zodat de pomp-brom,
+  // klepklikken en alarmen ook tijdens spreken hoorbaar blijven.
+  if (!AUDIO.initialized || !AUDIO.ambientGain || !AUDIO.ctx) return;
   if (AUDIO_AMBIENT_PRE_MUTE_GAIN !== null) return; // al gemute
   try {
     const now = AUDIO.ctx.currentTime;
     const fadeS = (VOICE_CONFIG.ambientFadeMs ?? 80) / 1000;
     const targetGain = VOICE_CONFIG.ambientFadedGain ?? 0.0;
-    AUDIO_AMBIENT_PRE_MUTE_GAIN = AUDIO.master.gain.value;
-    AUDIO.master.gain.cancelScheduledValues(now);
-    AUDIO.master.gain.setValueAtTime(AUDIO.master.gain.value, now);
-    AUDIO.master.gain.linearRampToValueAtTime(targetGain, now + fadeS);
+    AUDIO_AMBIENT_PRE_MUTE_GAIN = AUDIO.ambientGain.gain.value;
+    AUDIO.ambientGain.gain.cancelScheduledValues(now);
+    AUDIO.ambientGain.gain.setValueAtTime(AUDIO.ambientGain.gain.value, now);
+    AUDIO.ambientGain.gain.linearRampToValueAtTime(targetGain, now + fadeS);
   } catch (e) {
     console.warn('[OIP voice] audioMuteForRecording failed:', e);
   }
 }
 
 function audioRestoreAfterRecording() {
-  if (!AUDIO.initialized || !AUDIO.master || !AUDIO.ctx) return;
+  if (!AUDIO.initialized || !AUDIO.ambientGain || !AUDIO.ctx) return;
   if (AUDIO_AMBIENT_PRE_MUTE_GAIN === null) return; // niets te herstellen
   try {
     const now = AUDIO.ctx.currentTime;
     const fadeS = (VOICE_CONFIG.ambientFadeMs ?? 80) / 1000;
-    // Herstellen naar de huidige gewenste gain: 0.95 als enabled, 0 als uit.
-    // (We respecteren een eventuele wijziging in AUDIO.enabled tijdens opname.)
-    const restoreTo = AUDIO.enabled ? 0.95 : 0.0;
-    AUDIO.master.gain.cancelScheduledValues(now);
-    AUDIO.master.gain.setValueAtTime(AUDIO.master.gain.value, now);
-    AUDIO.master.gain.linearRampToValueAtTime(restoreTo, now + fadeS);
+    // Herstel naar het vooraf bewaarde niveau (default 1.0).
+    const restoreTo = AUDIO_AMBIENT_PRE_MUTE_GAIN;
+    AUDIO.ambientGain.gain.cancelScheduledValues(now);
+    AUDIO.ambientGain.gain.setValueAtTime(AUDIO.ambientGain.gain.value, now);
+    AUDIO.ambientGain.gain.linearRampToValueAtTime(restoreTo, now + fadeS);
     AUDIO_AMBIENT_PRE_MUTE_GAIN = null;
   } catch (e) {
     console.warn('[OIP voice] audioRestoreAfterRecording failed:', e);
@@ -4373,7 +4392,7 @@ function ambientHissAndWind() {
   hissFilter.Q.value = 4;
   const hissGain = ctx.createGain();
   hissGain.gain.value = 0.13;
-  hissSrc.connect(hissFilter).connect(hissGain).connect(AUDIO.master);
+  hissSrc.connect(hissFilter).connect(hissGain).connect(AUDIO.ambientGain);
   hissSrc.start();
 
   // Wind: laag-gefilterde ruis met trage gain LFO
@@ -4385,7 +4404,7 @@ function ambientHissAndWind() {
   windFilter.frequency.value = 350;
   const windGain = ctx.createGain();
   windGain.gain.value = 0.10;
-  windSrc.connect(windFilter).connect(windGain).connect(AUDIO.master);
+  windSrc.connect(windFilter).connect(windGain).connect(AUDIO.ambientGain);
   windSrc.start();
 
   // LFO voor de wind-amplitude — geeft vlagerig effect
@@ -4415,7 +4434,7 @@ function ambientHissAndHeartbeat() {
   hissFilter.Q.value = 3;
   const hissGain = ctx.createGain();
   hissGain.gain.value = 0.19;
-  hissSrc.connect(hissFilter).connect(hissGain).connect(AUDIO.master);
+  hissSrc.connect(hissFilter).connect(hissGain).connect(AUDIO.ambientGain);
   hissSrc.start();
 
   // Hartslag — lage thump elke ~0.8 sec, gemoduleerd voor spanning
@@ -4430,7 +4449,7 @@ function ambientHissAndHeartbeat() {
       g.gain.setValueAtTime(0, now);
       g.gain.linearRampToValueAtTime(0.26, now + 0.04);
       g.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
-      osc.connect(g).connect(AUDIO.master);
+      osc.connect(g).connect(AUDIO.ambientGain);
       osc.start(now);
       osc.stop(now + 0.3);
     }, 850);
@@ -4455,7 +4474,7 @@ function ambientPumpRoom() {
   filter.frequency.value = 180;
   const gain = ctx.createGain();
   gain.gain.value = 0.08;
-  src.connect(filter).connect(gain).connect(AUDIO.master);
+  src.connect(filter).connect(gain).connect(AUDIO.ambientGain);
   src.start();
 
   return () => {
@@ -4475,7 +4494,7 @@ function ambientCavitation() {
   const lowFilter = ctx.createBiquadFilter();
   lowFilter.type = 'lowpass';
   lowFilter.frequency.value = 400;
-  lowOsc.connect(lowFilter).connect(lowGain).connect(AUDIO.master);
+  lowOsc.connect(lowFilter).connect(lowGain).connect(AUDIO.ambientGain);
   lowOsc.start();
 
   // LFO voor onregelmatigheid
@@ -4496,7 +4515,7 @@ function ambientCavitation() {
   ratelFilter.Q.value = 6;
   const ratelGain = ctx.createGain();
   ratelGain.gain.value = 0.15;
-  ratel.connect(ratelFilter).connect(ratelGain).connect(AUDIO.master);
+  ratel.connect(ratelFilter).connect(ratelGain).connect(AUDIO.ambientGain);
   ratel.start();
 
   // Ratel-LFO
@@ -4563,7 +4582,7 @@ function playEffect(name) {
       gain.gain.setValueAtTime(0, now);
       gain.gain.linearRampToValueAtTime(0.25, now + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
-      src.connect(filter).connect(gain).connect(AUDIO.master);
+      src.connect(filter).connect(gain).connect(AUDIO.eventGain);
       src.start(now);
       src.stop(now + 0.4);
       break;
@@ -4581,7 +4600,7 @@ function playEffect(name) {
       gain.gain.setValueAtTime(0, now);
       gain.gain.linearRampToValueAtTime(0.2, now + 0.5);
       gain.gain.linearRampToValueAtTime(0.12, now + 1.4);
-      osc.connect(filter).connect(gain).connect(AUDIO.master);
+      osc.connect(filter).connect(gain).connect(AUDIO.eventGain);
       osc.start(now);
       osc.stop(now + 1.5);
       break;
@@ -4597,7 +4616,7 @@ function playEffect(name) {
         gain.gain.linearRampToValueAtTime(0.18, now + delay + 0.02);
         gain.gain.linearRampToValueAtTime(0.18, now + delay + 0.25);
         gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.3);
-        osc.connect(gain).connect(AUDIO.master);
+        osc.connect(gain).connect(AUDIO.eventGain);
         osc.start(now + delay);
         osc.stop(now + delay + 0.35);
       });
@@ -4625,7 +4644,7 @@ function playEffect(name) {
       filter.type = 'bandpass';
       filter.frequency.value = 1500;
       filter.Q.value = 1;
-      osc.connect(filter).connect(gain).connect(AUDIO.master);
+      osc.connect(filter).connect(gain).connect(AUDIO.eventGain);
       osc.start(now);
       lfo.start(now);
       osc.stop(now + dur);
@@ -4643,7 +4662,7 @@ function playEffect(name) {
       gain.gain.setValueAtTime(0, now);
       gain.gain.linearRampToValueAtTime(0.22, now + 0.1);
       gain.gain.exponentialRampToValueAtTime(0.001, now + 1.2);
-      src.connect(filter).connect(gain).connect(AUDIO.master);
+      src.connect(filter).connect(gain).connect(AUDIO.eventGain);
       src.start(now);
       src.stop(now + 1.3);
       break;
@@ -4658,7 +4677,7 @@ function playEffect(name) {
       gain.gain.setValueAtTime(0, now);
       gain.gain.linearRampToValueAtTime(0.3, now + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
-      osc.connect(gain).connect(AUDIO.master);
+      osc.connect(gain).connect(AUDIO.eventGain);
       osc.start(now);
       osc.stop(now + 0.5);
       break;
@@ -4693,7 +4712,7 @@ function startRadioBackground(roleType, isIncident) {
   const burstGain = ctx.createGain();
   burstGain.gain.setValueAtTime(0.18, ctx.currentTime);
   burstGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
-  burst.connect(burstFilter).connect(burstGain).connect(AUDIO.master);
+  burst.connect(burstFilter).connect(burstGain).connect(AUDIO.ambientGain);
   burst.start();
   burst.stop(ctx.currentTime + 0.3);
 
@@ -4711,7 +4730,7 @@ function startRadioBackground(roleType, isIncident) {
     const staticGain = ctx.createGain();
     // CRO heeft krachtiger signaal, collega's verder/zwakker
     staticGain.gain.value = (roleType === 'dispatch') ? 0.07 : 0.10;
-    staticSrc.connect(staticFilter).connect(staticGain).connect(AUDIO.master);
+    staticSrc.connect(staticFilter).connect(staticGain).connect(AUDIO.ambientGain);
     staticSrc.start();
     stopFns.push(() => {
       staticGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.15);
@@ -4735,7 +4754,7 @@ function startRadioBackground(roleType, isIncident) {
       g.gain.setValueAtTime(0, now);
       g.gain.linearRampToValueAtTime(isIncident ? 0.09 : 0.05, now + 0.01);
       g.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-      osc.connect(g).connect(AUDIO.master);
+      osc.connect(g).connect(AUDIO.ambientGain);
       osc.start(now);
       osc.stop(now + 0.2);
     }, pingInterval);
@@ -4754,7 +4773,7 @@ function startRadioBackground(roleType, isIncident) {
           g.gain.setValueAtTime(0, now);
           g.gain.linearRampToValueAtTime(0.07, now + 0.01);
           g.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
-          osc.connect(g).connect(AUDIO.master);
+          osc.connect(g).connect(AUDIO.ambientGain);
           osc.start(now);
           osc.stop(now + 0.12);
         });
@@ -4777,7 +4796,7 @@ function startRadioBackground(roleType, isIncident) {
       const now = ctx.currentTime;
       clickGain.gain.setValueAtTime(0.04, now);
       clickGain.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
-      click.connect(clickFilter).connect(clickGain).connect(AUDIO.master);
+      click.connect(clickFilter).connect(clickGain).connect(AUDIO.ambientGain);
       click.start(now);
       click.stop(now + 0.05);
     }, 80 + Math.random() * 40);
