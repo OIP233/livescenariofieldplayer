@@ -2885,9 +2885,14 @@ const VOICE_CONFIG = {
 
   // Drempel voor audio-piek tijdens opname (0..1). Als de maximale amplitude
   // tijdens de hele opname onder deze waarde blijft, wordt de blob NIET naar
-  // Whisper gestuurd — dit voorkomt hallucinaties uit stilte. Verhoog als je
-  // nog hallucinaties krijgt; verlaag als zachte spraak wordt geweigerd.
-  silenceThreshold: 0.06,
+  // Whisper gestuurd — dit voorkomt hallucinaties uit stilte.
+  //
+  // BELANGRIJK (v15): dit is alleen de FALLBACK-drempel voor wanneer er nog
+  // geen mic-kalibratie is gedaan. Na de radiocheck wordt de drempel automatisch
+  // aangepast aan de specifieke microfoon van het apparaat (zie getCalibratedThreshold).
+  // De fallback is bewust laag (0.025) zodat zwakke microfoons niet onnodig
+  // worden afgewezen — de kalibratie maakt 'm strikter wanneer mogelijk.
+  silenceThreshold: 0.025,
 
   // Minimum opnameduur (ms) en blob-grootte (bytes). Filtert onbedoelde
   // korte spatiebalk-aanrakingen uit.
@@ -2911,6 +2916,81 @@ let voiceSpaceDown = false;
 function getEffectiveLang() {
   return STATE.communicationLanguage || 'nl';
 }
+
+/* ─── Microfoon-kalibratie (v15) ─────────────────────────────
+   Elke microfoon heeft een eigen gevoeligheid. Een built-in laptop-mic op
+   60 cm afstand levert maxLevels rond 0.08 op tijdens spraak, terwijl een
+   headset-mic op 5 cm 0.4 haalt. Eén vaste drempel werkt dus niet — we
+   meten tijdens de radiocheck de typische piek-amplitude van de gebruiker
+   en leiden daar de drempel uit af.
+   ─────────────────────────────────────────────────────────── */
+
+function saveMicBaseline(level) {
+  if (!isFinite(level) || level < 0.01) {
+    console.log('[OIP voice] Skipping baseline save — value too low or invalid:', level);
+    return;
+  }
+  try {
+    localStorage.setItem('oip-voice-mic-baseline', String(level));
+    console.log('[OIP voice] Mic baseline opgeslagen: ' + level.toFixed(3) +
+                ' — nieuwe drempel wordt actief na herladen van de pagina.');
+  } catch (e) {
+    console.warn('[OIP voice] localStorage save failed:', e);
+  }
+}
+
+function getCalibratedThreshold() {
+  try {
+    const stored = localStorage.getItem('oip-voice-mic-baseline');
+    if (stored) {
+      const baseline = parseFloat(stored);
+      if (isFinite(baseline) && baseline > 0) {
+        // Drempel = 30% van piek-amplitude tijdens normale spraak.
+        // Min 0.015 (anders gaat alles inclusief stilte naar Whisper).
+        // Max 0.12 (anders worden zachte momenten in een gesprek afgewezen).
+        const calibrated = Math.max(0.015, Math.min(0.12, baseline * 0.30));
+        console.log('[OIP voice] Kalibratie actief — drempel: ' + calibrated.toFixed(3) +
+                    ' (mic baseline: ' + baseline.toFixed(3) + ')');
+        return calibrated;
+      }
+    }
+  } catch (e) {}
+  console.log('[OIP voice] Geen mic-baseline gevonden — fallback drempel: ' +
+              VOICE_CONFIG.silenceThreshold + ' (loop de radiocheck om te kalibreren)');
+  return VOICE_CONFIG.silenceThreshold;
+}
+
+/* Runtime-helpers voor handmatige tuning vanuit de console */
+window.setVoiceThreshold = function(value) {
+  if (!voiceInput) { console.warn('[OIP voice] voiceInput nog niet geïnitialiseerd'); return; }
+  if (typeof value !== 'number' || value < 0 || value > 1) {
+    console.warn('[OIP voice] Ongeldige waarde — gebruik een getal tussen 0 en 1');
+    return;
+  }
+  voiceInput.silenceThreshold = value;
+  console.log('[OIP voice] Drempel handmatig gezet op:', value);
+};
+
+window.getVoiceStatus = function() {
+  if (!voiceInput) { console.log('[OIP voice] voiceInput nog niet geïnitialiseerd'); return; }
+  let baseline = null;
+  try { baseline = parseFloat(localStorage.getItem('oip-voice-mic-baseline')) || null; } catch(_) {}
+  console.log('[OIP voice] Status:', {
+    state: voiceInput.state,
+    silenceThreshold: voiceInput.silenceThreshold,
+    minRecordingMs: voiceInput.minRecordingMs,
+    minBlobBytes: voiceInput.minBlobBytes,
+    lastRecordingMaxLevel: voiceInput.maxLevelDuringRecording,
+    savedMicBaseline: baseline,
+    language: voiceInput.language,
+  });
+};
+
+window.resetMicBaseline = function() {
+  try { localStorage.removeItem('oip-voice-mic-baseline'); } catch(_) {}
+  console.log('[OIP voice] Mic-baseline gewist — drempel valt terug op fallback (' +
+              VOICE_CONFIG.silenceThreshold + ') tot volgende kalibratie. Herlaad de pagina om actief te maken.');
+};
 
 /* ─── Inline VoiceInput-implementatie ─────────────────────────
    Self-contained: gebruikt MediaRecorder + getUserMedia +
@@ -3367,7 +3447,7 @@ async function initVoiceInput() {
       endpoint: `${VOICE_CONFIG.baseUrl.replace(/\/$/, '')}/api/transcribe`,
       language: getEffectiveLang(),
       prompt: buildVoicePrompt(),
-      silenceThreshold: VOICE_CONFIG.silenceThreshold,
+      silenceThreshold: getCalibratedThreshold(),
       minRecordingMs: VOICE_CONFIG.minRecordingMs,
       minBlobBytes: VOICE_CONFIG.minBlobBytes,
       audioLevelCallback: updateVoiceMeter,
@@ -3654,8 +3734,19 @@ function runRadioCheck() {
           if (meter) Array.from(meter.children).forEach(b => b.className = 'rc-bar');
         }
       },
-      onTranscript: text => { showRadioCheckResult(text, T); },
-      onError: err => { showRadioCheckError(err, T); },
+      onTranscript: text => {
+        // v15: bewaar de piek-amplitude van deze testopname als mic-baseline.
+        // Hiermee wordt de drempel automatisch afgestemd op het huidige device.
+        saveMicBaseline(checkVoice.maxLevelDuringRecording);
+        showRadioCheckResult(text, T);
+      },
+      onError: err => {
+        // Ook bij fout: als er audio was, gebruik dat voor baseline.
+        if (checkVoice.maxLevelDuringRecording > 0.02) {
+          saveMicBaseline(checkVoice.maxLevelDuringRecording);
+        }
+        showRadioCheckError(err, T);
+      },
     });
 
     let downActive = false;
@@ -3790,8 +3881,11 @@ function computeWordOverlap(actual, expected) {
 }
 
 window.resetRadioCheck = function() {
-  try { localStorage.removeItem('oip-radiocheck-done'); } catch (_) {}
-  console.log('[OIP radiocheck] Reset — modal verschijnt weer bij volgende scenario-start.');
+  try {
+    localStorage.removeItem('oip-radiocheck-done');
+    localStorage.removeItem('oip-voice-mic-baseline');  // v15: ook baseline wissen
+  } catch (_) {}
+  console.log('[OIP radiocheck] Reset — modal verschijnt weer bij volgende scenario-start. Mic-baseline ook gewist.');
 };
 window.runRadioCheckNow = function() {
   if (!voiceReady) {
