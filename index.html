@@ -507,6 +507,73 @@ input, textarea {
   border-color: var(--cyan);
   color: var(--cyan);
 }
+
+/* v18: Pauzeknop in de top-bar — naar voorbeeld van CRO-player. */
+.pause-btn {
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 5px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all .15s;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.pause-btn:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.pause-btn.paused {
+  border-color: var(--green);
+  color: var(--green);
+  background: var(--green-bg);
+}
+.pause-btn:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
+
+/* v18: Pauze-overlay banner — verschijnt bij gepauzeerd scenario. */
+#pause-overlay {
+  position: absolute;
+  inset: 48px 0 0 0;          /* onder top-bar */
+  background: rgba(8, 12, 20, 0.55);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  display: none;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 80px;
+  z-index: 300;
+  pointer-events: auto;       /* klikken op overlay = niets, blokkeert wel */
+}
+#pause-overlay.active { display: flex; }
+#pause-overlay .pause-card {
+  background: var(--bg2);
+  border: 1px solid var(--amber);
+  border-radius: 6px;
+  padding: 14px 22px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5), 0 0 0 1px rgba(255,184,77,.15);
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-bright);
+  letter-spacing: 1px;
+}
+#pause-overlay .pause-card .pause-led {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 10px var(--amber);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
 .clock .norm {
   color: var(--text-muted);
   margin-left: 4px;
@@ -898,7 +965,10 @@ input, textarea {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   aspect-ratio: 16 / 9;
-  max-height: 65%;
+  /* v18: viewport-aware sizing zodat de middle-panel inhoud past op laptop-
+     schermen zonder fullscreen. clamp() houdt het frame tussen 200px (op
+     kleine schermen) en 480px (op grote schermen), met 50vh als doel. */
+  max-height: clamp(200px, 50vh, 480px);
 }
 #storyline-wrap.expanded {
   position: fixed;
@@ -999,15 +1069,15 @@ input, textarea {
 }
 
 #environment-text {
-  padding: 14px 18px;
+  padding: 12px 18px;
   background: var(--panel-sub);
   border-bottom: 1px solid var(--border);
   font-size: 13px;
-  line-height: 1.6;
+  line-height: 1.55;
   color: var(--text);
   flex-shrink: 0;
-  max-height: 160px;
-  min-height: 80px;
+  max-height: 140px;   /* v18: was 160, iets compacter voor laptop-fit */
+  min-height: 64px;    /* v18: was 80 */
   overflow-y: auto;
   position: relative;
   transition: background 0.4s ease, box-shadow 0.4s ease;
@@ -1089,10 +1159,10 @@ input, textarea {
 
 #input-bar {
   flex: 0 0 auto;
-  padding: 10px 14px;
+  padding: 8px 14px 10px;   /* v18: was 10/14, iets compacter */
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;                  /* v18: was 6 */
   background: var(--bg-deep);
 }
 
@@ -1118,8 +1188,8 @@ input, textarea {
   border-radius: 4px;
   font-size: 13px;
   resize: none;
-  min-height: 72px;
-  max-height: 140px;
+  min-height: 56px;    /* v18: was 72 — compacter voor laptop-fit */
+  max-height: 120px;   /* v18: was 140 */
 }
 #input-text:focus {
   outline: none;
@@ -2238,8 +2308,17 @@ input, textarea {
       <div class="location-dropdown" id="location-dropdown"></div>
     </div>
     <div class="spacer"></div>
+    <button id="pause-btn" class="pause-btn" type="button" onclick="togglePause()" title="Pauzeer scenario" disabled>⏸ Pauze</button>
     <button id="audio-toggle" class="audio-btn" title="Geluid aan (klik om uit te schakelen)" onclick="audioToggle()">🔊</button>
     <div class="clock" id="clock">00:00</div>
+  </div>
+
+  <!-- v18: Pauze-overlay. Verschijnt over het scenario bij gepauzeerde toestand. -->
+  <div id="pause-overlay">
+    <div class="pause-card">
+      <div class="pause-led"></div>
+      <span id="pause-overlay-text">Scenario gepauzeerd</span>
+    </div>
   </div>
 
   <div class="panels">
@@ -2867,6 +2946,9 @@ const STATE = {
   feedMessages: [],                     // {role, text, instructor: bool, channel}
   scenarioEndMs: 0,                     // tijdstip van scenario-einde — voor PDF/Excel
   debriefText: '',                      // gegenereerde debrief — bewaard voor export
+  // v18: pauze-state
+  isPaused: false,                      // wordt true tijdens pauze
+  pausedAtMs: 0,                        // tijdstip van pauze-start — om duur te berekenen
 };
 
 /* ═══════════════════════════════════════════════════════════
@@ -4031,6 +4113,7 @@ function updateVoiceMeter(level) {
 function onPttDown(e) {
   e.preventDefault();
   if (!voiceInput || !voiceReady) return;
+  if (STATE.isPaused || STATE.scenarioEnded) return;   // v18: niet tijdens pauze
   const btn = document.getElementById('ptt-btn');
   if (btn.disabled) return;
   voiceInput.start();
@@ -4047,6 +4130,7 @@ function onPttCancel(e) {
 function onPttKeyDown(e) {
   if (e.code !== 'Space' || e.repeat) return;
   if (!voiceInput || !voiceReady) return;
+  if (STATE.isPaused || STATE.scenarioEnded) return;   // v18: niet tijdens pauze
   const btn = document.getElementById('ptt-btn');
   if (btn?.disabled) return;
   if (e.ctrlKey || e.altKey || e.metaKey) return;
@@ -4865,7 +4949,6 @@ function clockTick() {
     const tStr = String(Math.floor(target/60)).padStart(2,'0') + ':' + String(target%60).padStart(2,'0');
     clock.innerHTML = elapsed + '<span class="norm">⇥ ' + tStr + '</span>';
     if (STATE.firstActionTime !== null) {
-      // Eerste must-actie al gedaan — neutrale tint
       clock.className = 'clock on-time';
     } else if (s > target) {
       clock.className = 'clock over-norm';
@@ -4879,6 +4962,140 @@ function clockTick() {
     clock.className = 'clock';
   }
 }
+
+/* ═══════════════════════════════════════════════════════════
+   v18: PAUSE / RESUME — overgenomen uit CRO-player.
+   Bevriest de klok en blokkeert alle deelnemer-input (verzend,
+   PTT, observatieknoppen, locatie-wissel). De pauzeduur wordt
+   bij hervatten op scenarioStartMs bijgeteld, zodat de elapsed
+   time naadloos verder loopt zonder de tussentijd mee te tellen.
+   ═══════════════════════════════════════════════════════════ */
+
+function togglePause() {
+  if (STATE.scenarioEnded) return;
+  if (STATE.isPaused) resumeScenario();
+  else pauseScenario();
+}
+
+function pauseScenario() {
+  if (STATE.isPaused || STATE.scenarioEnded) return;
+  STATE.isPaused = true;
+  STATE.pausedAtMs = Date.now();
+
+  // Klok bevriezen
+  if (STATE.clockInterval) {
+    clearInterval(STATE.clockInterval);
+    STATE.clockInterval = null;
+  }
+
+  // Eventuele lopende AI-call laten we doorlopen — die kan niet veilig
+  // geannuleerd worden, maar de UI blokkeert wel de volgende interactie.
+
+  // Input volledig blokkeren
+  applyPauseLock(true);
+
+  // UI: knop omwisselen + overlay tonen + systeem-melding
+  const btn = $('pause-btn');
+  if (btn) {
+    btn.innerHTML = '▶ Hervat';
+    btn.classList.add('paused');
+    btn.title = 'Scenario hervatten';
+  }
+  const overlay = $('pause-overlay');
+  if (overlay) overlay.classList.add('active');
+  const overlayText = $('pause-overlay-text');
+  if (overlayText) overlayText.textContent = pauseTextForLang('paused');
+
+  addSystemMessage(pauseTextForLang('pausedLog'));
+  console.log('[Field Player] Scenario paused at', new Date(STATE.pausedAtMs).toISOString());
+}
+
+function resumeScenario() {
+  if (!STATE.isPaused) return;
+  const pauseDuration = Date.now() - STATE.pausedAtMs;
+
+  // Verschuif scenarioStartMs zodat verstreken tijd naadloos doorloopt
+  STATE.scenarioStartMs += pauseDuration;
+  STATE.isPaused = false;
+  STATE.pausedAtMs = 0;
+
+  // Klok hervatten
+  if (!STATE.clockInterval) {
+    STATE.clockInterval = setInterval(clockTick, 1000);
+    clockTick();
+  }
+
+  // Input weer vrijgeven
+  applyPauseLock(false);
+
+  // UI: knop terug + overlay weg + systeem-melding
+  const btn = $('pause-btn');
+  if (btn) {
+    btn.innerHTML = '⏸ Pauze';
+    btn.classList.remove('paused');
+    btn.title = 'Pauzeer scenario';
+  }
+  const overlay = $('pause-overlay');
+  if (overlay) overlay.classList.remove('active');
+
+  const durStr = Math.round(pauseDuration / 1000) + 's';
+  addSystemMessage(pauseTextForLang('resumedLog', { dur: durStr }));
+  console.log('[Field Player] Scenario resumed after', durStr);
+}
+
+// Schakelt alle deelnemer-input aan of uit op basis van pauze-toestand.
+// Wordt ook gerespecteerd door syncPttToSendButton (zie voice-module).
+function applyPauseLock(locked) {
+  const send = $('btn-send');
+  if (send) send.disabled = locked || STATE.isProcessing;
+  document.querySelectorAll('.obs-btn').forEach(b => {
+    b.disabled = locked || STATE.isProcessing;
+  });
+  const inp = $('input-text');
+  if (inp) inp.disabled = locked;
+  const loc = $('topbar-location');
+  if (loc) loc.style.pointerEvents = locked ? 'none' : '';
+  const audioToggle = $('audio-toggle');
+  if (audioToggle) audioToggle.disabled = locked;
+  // PTT: laat de bestaande sync-functie het bepalen — die kijkt naar
+  // voiceReady + send.disabled, dus pauze propageert automatisch.
+  if (typeof syncPttToSendButton === 'function') syncPttToSendButton();
+}
+
+// Korte vertaalde teksten voor de pauze-meldingen.
+function pauseTextForLang(key, vars) {
+  const lang = STATE.communicationLanguage || 'nl';
+  const T = {
+    nl: { paused: 'Scenario gepauzeerd',
+          pausedLog: '── Scenario gepauzeerd ──',
+          resumedLog: '── Scenario hervat (pauze: ' + (vars?.dur || '?') + ') ──' },
+    en: { paused: 'Scenario paused',
+          pausedLog: '── Scenario paused ──',
+          resumedLog: '── Scenario resumed (paused: ' + (vars?.dur || '?') + ') ──' },
+    de: { paused: 'Szenario pausiert',
+          pausedLog: '── Szenario pausiert ──',
+          resumedLog: '── Szenario fortgesetzt (Pause: ' + (vars?.dur || '?') + ') ──' },
+    es: { paused: 'Escenario en pausa',
+          pausedLog: '── Escenario en pausa ──',
+          resumedLog: '── Escenario reanudado (pausa: ' + (vars?.dur || '?') + ') ──' },
+  };
+  return (T[lang] || T.nl)[key] || key;
+}
+
+// Sneltoets: spatie is voor PTT, dus we gebruiken P voor pauze.
+document.addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyP' || e.repeat) return;
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  const tag = (e.target?.tagName || '').toUpperCase();
+  if (tag === 'TEXTAREA' || tag === 'INPUT') return;          // niet tijdens typen
+  if (document.querySelector('.modal-backdrop.active')) return; // niet tijdens modals
+  if (!$('screen-scenario')?.classList.contains('active')) return; // alleen tijdens scenario
+  e.preventDefault();
+  togglePause();
+});
+
+// Window helper om vanuit console te kunnen pauzeren — handig voor testen.
+window.togglePauseFromConsole = togglePause;
 
 // Bereken huidige timing-status voor in debrief
 function getTimingStatus() {
@@ -5925,6 +6142,15 @@ async function startScenario() {
   STATE.scenarioStartMs = Date.now();
   STATE.actionLog = [];
   STATE.firstActionTime = null;
+  // v18: pauze-state opnieuw bij start (voor het geval scenario opnieuw start)
+  STATE.isPaused = false;
+  STATE.pausedAtMs = 0;
+  const pauseBtn = $('pause-btn');
+  if (pauseBtn) {
+    pauseBtn.disabled = false;
+    pauseBtn.classList.remove('paused');
+    pauseBtn.innerHTML = '⏸ Pauze';
+  }
   STATE.clockInterval = setInterval(clockTick, 1000);
   clockTick();
 
@@ -6008,6 +6234,7 @@ function toggleLocationDropdown(e) {
 document.addEventListener('click', () => $('location-dropdown')?.classList.remove('open'));
 
 function changeLocation(locId) {
+  if (STATE.isPaused || STATE.scenarioEnded) return;
   if (locId === STATE.currentLocationId) return;
   const newLoc = getLocation(locId);
   STATE.currentLocationId = locId;
@@ -6185,12 +6412,13 @@ function triggerHoldPoint(hpId) {
 }
 
 async function observe(sense) {
-  if (STATE.isProcessing || STATE.scenarioEnded) return;
+  if (STATE.isProcessing || STATE.scenarioEnded || STATE.isPaused) return;
   const loc = getCurrentLocation();
   await callClaude(`[OBSERVATIE: ${sense}] (Deelnemer probeert actief waar te nemen via ${sense} op locatie ${loc.label}. Reageer met een waarneming via [WAARNEMING: ${sense}] gevolgd door wat de deelnemer hier en nu via deze zintuig waarneemt.)`);
 }
 
 async function sendUserMessage() {
+  if (STATE.isPaused || STATE.scenarioEnded) return;
   const txt = $('input-text').value.trim();
   if (!txt) return;
   const channel = STATE.currentChannel;
@@ -6204,6 +6432,19 @@ function endScenario(reason) {
   if (STATE.scenarioEnded) return;
   STATE.scenarioEnded = true;
   STATE.endReason = reason || 'completed';
+  // v18: pauze-state opruimen — overlay en knop terug naar default
+  if (STATE.isPaused) {
+    STATE.isPaused = false;
+    STATE.pausedAtMs = 0;
+  }
+  const pauseOverlay = $('pause-overlay');
+  if (pauseOverlay) pauseOverlay.classList.remove('active');
+  const pauseBtn = $('pause-btn');
+  if (pauseBtn) {
+    pauseBtn.disabled = true;
+    pauseBtn.classList.remove('paused');
+    pauseBtn.innerHTML = '⏸ Pauze';
+  }
   goToDebrief(false);
 }
 
