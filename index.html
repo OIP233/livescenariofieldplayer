@@ -4114,6 +4114,10 @@ function onPttDown(e) {
   e.preventDefault();
   if (!voiceInput || !voiceReady) return;
   if (STATE.isPaused || STATE.scenarioEnded) return;   // v18: niet tijdens pauze
+  // v19: niet tijdens radiocheck — anders neemt de main-PTT óók op en wordt
+  // de testzin ge-transcribeerd naar het invoerveld, wat als CRO-bericht verschijnt
+  // zodra het scenario daadwerkelijk start.
+  if (document.getElementById('radiocheck-overlay')?.classList.contains('active')) return;
   const btn = document.getElementById('ptt-btn');
   if (btn.disabled) return;
   voiceInput.start();
@@ -4131,6 +4135,10 @@ function onPttKeyDown(e) {
   if (e.code !== 'Space' || e.repeat) return;
   if (!voiceInput || !voiceReady) return;
   if (STATE.isPaused || STATE.scenarioEnded) return;   // v18: niet tijdens pauze
+  // v19: niet tijdens radiocheck — de radiocheck-overlay heeft een eigen
+  // mic-flow met eigen baseline-meting. Spatie laten we daar exclusief
+  // voor de radiocheck-instance werken.
+  if (document.getElementById('radiocheck-overlay')?.classList.contains('active')) return;
   const btn = document.getElementById('ptt-btn');
   if (btn?.disabled) return;
   if (e.ctrlKey || e.altKey || e.metaKey) return;
@@ -4393,7 +4401,9 @@ function audioInit() {
 
 function audioToggle() {
   AUDIO.enabled = !AUDIO.enabled;
-  if (AUDIO.master) {
+  // v19: tijdens pauze willen we geen geluid produceren — alleen de intent
+  // omschakelen. Bij hervatten wordt het juiste niveau toegepast.
+  if (AUDIO.master && !AUDIO_PAUSED) {
     AUDIO.master.gain.linearRampToValueAtTime(
       AUDIO.enabled ? 0.95 : 0,
       AUDIO.ctx.currentTime + 0.2
@@ -4416,6 +4426,41 @@ function audioToggle() {
 // Houdt bij welk gain-niveau actief was voordat we muten — zodat we precies
 // kunnen herstellen, ook als de user tussendoor de audio-toggle gebruikt heeft.
 let AUDIO_AMBIENT_PRE_MUTE_GAIN = null;
+
+// v19: pauze-mute houdt het volledige master-signaal stil (ambient én events).
+// Onafhankelijk van de PTT-mute, zodat ze elkaar niet doorkruisen.
+let AUDIO_PAUSED = false;
+
+function audioMuteForPause() {
+  if (!AUDIO.initialized || !AUDIO.master || !AUDIO.ctx) return;
+  if (AUDIO_PAUSED) return;
+  AUDIO_PAUSED = true;
+  try {
+    const now = AUDIO.ctx.currentTime;
+    AUDIO.master.gain.cancelScheduledValues(now);
+    AUDIO.master.gain.setValueAtTime(AUDIO.master.gain.value, now);
+    AUDIO.master.gain.linearRampToValueAtTime(0, now + 0.20);
+  } catch (e) {
+    console.warn('[Field Player] audioMuteForPause failed:', e);
+  }
+}
+
+function audioRestoreAfterPause() {
+  if (!AUDIO.initialized || !AUDIO.master || !AUDIO.ctx) return;
+  if (!AUDIO_PAUSED) return;
+  AUDIO_PAUSED = false;
+  try {
+    const now = AUDIO.ctx.currentTime;
+    // Herstel naar het door-de-gebruiker-gewenste niveau (respecteert eventuele
+    // toggle die tijdens pauze is omgezet — zie audioToggle).
+    const restoreTo = AUDIO.enabled ? 0.95 : 0.0;
+    AUDIO.master.gain.cancelScheduledValues(now);
+    AUDIO.master.gain.setValueAtTime(AUDIO.master.gain.value, now);
+    AUDIO.master.gain.linearRampToValueAtTime(restoreTo, now + 0.20);
+  } catch (e) {
+    console.warn('[Field Player] audioRestoreAfterPause failed:', e);
+  }
+}
 
 function audioMuteForRecording() {
   // v17: alleen ambientGain muten; eventGain blijft open zodat de pomp-brom,
@@ -4766,6 +4811,52 @@ function playEffect(name) {
       osc.stop(now + 0.5);
       break;
     }
+    case 'instructor-chime': {
+      // v20: Twee-tonige opwaartse chime (A5 → D6) — overgenomen uit CRO-player.
+      // Markeert akoestisch dat de INSTRUCTEUR spreekt (geen radio-rol, dus
+      // krijgt geen radio-achtergrond — de chime is de hoorbare cue).
+      // Route via eventGain → blijft hoorbaar tijdens PTT (zoals andere events).
+      const playChimeNote = (freq, dur, startOffset, vol, harmonics) => {
+        const start = now + startOffset;
+        const stop = start + dur;
+        // Envelope-gain (attack / sustain / release)
+        const env = ctx.createGain();
+        const attack = Math.min(0.012, dur * 0.10);
+        const release = Math.min(0.040, dur * 0.30);
+        env.gain.setValueAtTime(0, start);
+        env.gain.linearRampToValueAtTime(vol, start + attack);
+        env.gain.setValueAtTime(vol, stop - release);
+        env.gain.linearRampToValueAtTime(0, stop);
+        env.connect(AUDIO.eventGain);
+        // Grondtoon (sine)
+        const oscMain = ctx.createOscillator();
+        const gMain = ctx.createGain();
+        oscMain.type = 'sine';
+        oscMain.frequency.setValueAtTime(freq, start);
+        gMain.gain.setValueAtTime(1.0, start);
+        oscMain.connect(gMain).connect(env);
+        oscMain.start(start);
+        oscMain.stop(stop);
+        // Boventonen voor klankkleur
+        (harmonics || []).forEach(h => {
+          const oscH = ctx.createOscillator();
+          const gH = ctx.createGain();
+          oscH.type = 'sine';
+          oscH.frequency.setValueAtTime(freq * h.ratio, start);
+          gH.gain.setValueAtTime(h.vol, start);
+          oscH.connect(gH).connect(env);
+          oscH.start(start);
+          oscH.stop(stop);
+        });
+      };
+      // Note 1: A5 (880Hz), 0.14s + 0.05s gap = startOffset volgende note: 0.19s
+      playChimeNote(880, 0.14, 0.00, 0.32,
+        [{ ratio: 2, vol: 0.10 }, { ratio: 3, vol: 0.04 }]);
+      // Note 2: D6 (1175Hz), 0.20s
+      playChimeNote(1175, 0.20, 0.19, 0.28,
+        [{ ratio: 2, vol: 0.10 }]);
+      break;
+    }
     default:
       console.warn('Onbekend audio effect:', name);
   }
@@ -4988,6 +5079,9 @@ function pauseScenario() {
     STATE.clockInterval = null;
   }
 
+  // v19: scenario-audio stilzetten (ambient + events). Wordt hersteld bij hervat.
+  audioMuteForPause();
+
   // Eventuele lopende AI-call laten we doorlopen — die kan niet veilig
   // geannuleerd worden, maar de UI blokkeert wel de volgende interactie.
 
@@ -5025,6 +5119,9 @@ function resumeScenario() {
     clockTick();
   }
 
+  // v19: scenario-audio hervatten (respecteert eventuele toggle-wijziging tijdens pauze)
+  audioRestoreAfterPause();
+
   // Input weer vrijgeven
   applyPauseLock(false);
 
@@ -5055,8 +5152,8 @@ function applyPauseLock(locked) {
   if (inp) inp.disabled = locked;
   const loc = $('topbar-location');
   if (loc) loc.style.pointerEvents = locked ? 'none' : '';
-  const audioToggle = $('audio-toggle');
-  if (audioToggle) audioToggle.disabled = locked;
+  // v19: audio-toggle blijft bedienbaar tijdens pauze, zodat de operator
+  // de geluids-intent kan omschakelen voordat hij hervat.
   // PTT: laat de bestaande sync-functie het bepalen — die kijkt naar
   // voiceReady + send.disabled, dus pauze propageert automatisch.
   if (typeof syncPttToSendButton === 'function') syncPttToSendButton();
@@ -5122,8 +5219,12 @@ function getTimingStatus() {
 function buildSystemPrompt() {
   const sc = getScenario();
   const isIncident = sc.scenarioType === 'incident';
+  // v19: de "type" tussen haakjes is een interne categorie voor radio-gedrag —
+  // de AI moet rollen ALTIJD aanspreken/aanduiden met hun NAAM (bv. "CRO",
+  // "Karel", "Supervisor"), nooit met het type ("dispatch", "colleague" enz.).
+  // Deze instructie staat ook in BELANGRIJKE REGELS verderop in de prompt.
   const rolesList = sc.roles.map(r => 
-    `- ${r.name} (${r.type}): ${r.behavior}`
+    `- ${r.name} (intern type: ${r.type}): ${r.behavior}`
   ).join('\n');
 
   const lsrList = Object.entries(LIFE_SAVING_RULES).map(([k,v]) => `- ${k}: ${v}`).join('\n');
@@ -5310,6 +5411,13 @@ ROLLEN (scenario-personages)
 ═══════════════════════════════════════════════════════════
 ${rolesList}
 
+BELANGRIJK — naamgeving in communicatie:
+- Spreek scenario-rollen ALTIJD aan en verwijs naar ze met hun NAAM (bijvoorbeeld "${(sc.roles[0]||{}).name || 'CRO'}", "${(sc.roles[1]||{}).name || 'Karel'}", "${(sc.roles[2]||{}).name || 'Supervisor'}").
+- Gebruik NOOIT de interne type-aanduidingen (zoals "dispatch", "colleague", "supervisor", "external") in dialogen of in verwijzingen tussen rollen.
+- Voorbeeld correct:  "Ik bel de CRO even"   —   "Karel, kun jij...?"
+- Voorbeeld FOUT:     "Ik bel Dispatch"      —   "Colleague, kun jij...?"
+- Het type tussen haakjes hierboven is louter een interne categorie voor radio-gedrag en mag niet worden geuit.
+
 ═══════════════════════════════════════════════════════════
 INSTRUCTEUR — mode: ${mode}
 ═══════════════════════════════════════════════════════════
@@ -5466,7 +5574,7 @@ function buildStatusBlock() {
 Scenario-type: incident
 Fase: ${STATE.currentPhase} (${getPhaseName(STATE.currentPhase)})
 Locatie deelnemer: ${loc.id} (${loc.label})
-Kanaal waarop deelnemer spreekt: ${STATE.currentChannel}
+Kanaal waarop deelnemer spreekt: ${getCurrentChannelRoleName()}
 ${timeLine}
 
 Verwachte acties — must:
@@ -5494,7 +5602,7 @@ ${logLines}`;
 Scenario-type: procedural
 Fase: ${STATE.currentPhase} (${getPhaseName(STATE.currentPhase)})
 Locatie deelnemer: ${loc.id} (${loc.label})
-Kanaal waarop deelnemer spreekt: ${STATE.currentChannel}
+Kanaal waarop deelnemer spreekt: ${getCurrentChannelRoleName()}
 ${timeLine}
 LMRA voltooid: ${STATE.lmraCompleted ? 'ja' : 'nee'}
 
@@ -6026,6 +6134,10 @@ async function addFeedMessage(roleName, text) {
   let stopBg = () => {};
   if (roleType !== 'instructor') {
     stopBg = startRadioBackground(roleType, isIncident);
+  } else {
+    // v20: hoorbare cue dat de Instructeur spreekt — twee-tonige chime.
+    // Route via eventGain → blijft hoorbaar tijdens PTT-opname.
+    try { playEffect('instructor-chime'); } catch (e) { console.warn('chime failed:', e); }
   }
 
   try {
@@ -6176,6 +6288,10 @@ async function startScenario() {
   // kan testen en weet hoe de PTT werkt voordat het scenario echt loopt.
   await initVoiceInput();
   await maybeRunRadioCheck();
+  // v19: invoerveld leegmaken na radiocheck — defensief, voorkomt dat een
+  // testzin per ongeluk als eerste CRO-bericht wordt verstuurd.
+  const inp = $('input-text');
+  if (inp) inp.value = '';
   syncPttToSendButton();
 
   await callClaude(null);
@@ -6411,6 +6527,15 @@ function triggerHoldPoint(hpId) {
   overlay.classList.add('active');
 }
 
+// v19: vertaal de huidige channel-type naar de zichtbare ROLNAAM.
+// Wordt gebruikt in prompts zodat de AI nooit het interne type (bv. 'dispatch')
+// hoeft te noemen — alleen de scenario-naam (bv. 'CRO').
+function getCurrentChannelRoleName() {
+  const sc = getScenario();
+  const role = (sc.roles || []).find(r => r.type === STATE.currentChannel);
+  return role ? role.name : STATE.currentChannel;
+}
+
 async function observe(sense) {
   if (STATE.isProcessing || STATE.scenarioEnded || STATE.isPaused) return;
   const loc = getCurrentLocation();
@@ -6421,11 +6546,13 @@ async function sendUserMessage() {
   if (STATE.isPaused || STATE.scenarioEnded) return;
   const txt = $('input-text').value.trim();
   if (!txt) return;
-  const channel = STATE.currentChannel;
-  const channelName = $('current-channel-display').textContent;
+  const channelName = getCurrentChannelRoleName();
   addUserMessage(txt, channelName);
   $('input-text').value = '';
-  await callClaude(`[Deelnemer spreekt op kanaal ${channel.toUpperCase()} (gericht aan ${channelName})] ${txt}`);
+  // v19: gebruik consequent de rolNAAM (bv. CRO) i.p.v. het interne type
+  // (bv. DISPATCH). Voorkomt dat andere AI-rollen naar elkaar verwijzen
+  // met type-aanduidingen.
+  await callClaude(`[Deelnemer spreekt via radio gericht aan ${channelName}] ${txt}`);
 }
 
 function endScenario(reason) {
