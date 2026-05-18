@@ -127,7 +127,7 @@ input, textarea {
   padding: 40px 48px;
   overflow-y: auto;
 }
-#screen-choose .choose-wrap { max-width: 900px; }
+#screen-choose .choose-wrap { max-width: 1180px; }
 #screen-choose .title {
   font-size: 13px;
   color: var(--cyan);
@@ -148,8 +148,14 @@ input, textarea {
 }
 .scenario-cards {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 16px;
+}
+@media (max-width: 1080px) {
+  .scenario-cards { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 720px) {
+  .scenario-cards { grid-template-columns: 1fr; }
 }
 .scenario-card {
   background: var(--panel-sub);
@@ -158,11 +164,98 @@ input, textarea {
   padding: 20px 22px;
   cursor: pointer;
   transition: all 0.15s;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 .scenario-card:hover {
   border-color: var(--cyan);
   background: var(--panel);
 }
+
+/* ─── Custom-loader kaart (3e kaart, leeg-staat) ──────────── */
+.scenario-card.loader-empty {
+  border: 1px dashed var(--border);
+  background: transparent;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 200px;
+}
+.scenario-card.loader-empty:hover {
+  border-color: var(--cyan);
+  border-style: dashed;
+  background: rgba(127,219,255,0.04);
+}
+.scenario-card.loader-empty .loader-icon {
+  font-size: 28px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  line-height: 1;
+}
+.scenario-card.loader-empty:hover .loader-icon { color: var(--cyan); }
+.scenario-card.loader-empty h3 {
+  font-size: 15px;
+  color: var(--text-bright);
+  margin: 0 0 6px;
+}
+.scenario-card.loader-empty p {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 0;
+  max-width: 220px;
+}
+
+/* ─── Custom-loader kaart (gevulde staat — getransformeerd) ─── */
+.scenario-card.loader-filled {
+  border: 1px solid var(--cyan-dim, var(--cyan));
+  background: rgba(127,219,255,0.04);
+}
+.scenario-card .replace-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.scenario-card .replace-btn:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  background: rgba(127,219,255,0.08);
+}
+.type-badge.custom {
+  background: rgba(127,219,255,0.10);
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+}
+
+/* ─── Validatie-foutmelding onder de kaarten ─── */
+.load-error {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--red, #ff5470);
+  background: rgba(255,84,112,0.08);
+  border-radius: 4px;
+  color: var(--red, #ff5470);
+  font-size: 13px;
+  line-height: 1.5;
+  display: none;
+}
+.load-error.show { display: block; }
+.load-error strong { color: var(--text-bright); display: block; margin-bottom: 4px; }
+.load-error ul { margin: 6px 0 0; padding-left: 18px; }
+.load-error li { margin: 2px 0; }
 .scenario-card h3 {
   margin: 8px 0 8px;
   font-size: 17px;
@@ -2225,7 +2318,7 @@ input, textarea {
   <div class="choose-wrap">
     <div class="title">Kies een scenario</div>
     <h1>Beschikbare scenario's</h1>
-    <p class="sub">Twee demo-scenario's zijn beschikbaar in deze MVP. Beide gebruiken hetzelfde Player-systeem maar verschillen in karakter en didactische focus.</p>
+    <p class="sub">Twee demo-scenario's zijn beschikbaar in deze MVP, of laad een eigen scenario dat in de Field Controller is gebouwd. Alle scenario's gebruiken hetzelfde Player-systeem.</p>
 
     <div class="scenario-cards">
       <div class="scenario-card" data-scenario="pump-p101" onclick="chooseScenario('pump-p101')">
@@ -2245,7 +2338,20 @@ input, textarea {
           <span>3 fasen</span><span>•</span><span>Beoordelings-gedreven</span><span>•</span><span>Difficulty 4</span>
         </div>
       </div>
+
+      <!-- 3e kaart: eigen scenario laden (lege staat) -->
+      <div class="scenario-card loader-empty" id="loader-card" onclick="triggerCustomLoad()">
+        <div class="loader-icon">↑</div>
+        <h3>Eigen scenario laden</h3>
+        <p>Laad een scenario-bestand uit de Field Controller (.json)</p>
+      </div>
     </div>
+
+    <!-- Validatie-foutmelding -->
+    <div class="load-error" id="load-error"></div>
+
+    <!-- Verborgen file input voor JSON-import -->
+    <input type="file" id="custom-scenario-file" accept=".json,application/json" style="display:none" onchange="handleCustomScenarioFile(event)">
   </div>
 </div>
 
@@ -6192,6 +6298,187 @@ function confirmApiKey() {
   if (!k) { alert('Vul een API-sleutel in.'); return; }
   STATE.apiKey = k;
   show('screen-choose');
+}
+
+/* ───── 11a. CUSTOM SCENARIO LOADER (JSON-import) ───── */
+
+// Verwachte schema-versie. Bij verschil: waarschuwen, niet weigeren.
+const EXPECTED_SCHEMA_VERSION = 3;
+
+function triggerCustomLoad() {
+  clearLoadError();
+  document.getElementById('custom-scenario-file').click();
+}
+
+function handleCustomScenarioFile(ev) {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = ''; // reset zodat hetzelfde bestand opnieuw kan
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onerror = () => showLoadError('Kon het bestand niet lezen.', []);
+  reader.onload = (e) => {
+    let obj;
+    try {
+      obj = JSON.parse(e.target.result);
+    } catch (err) {
+      showLoadError('Bestand is geen geldige JSON.', [err.message]);
+      return;
+    }
+
+    const issues = validateScenario(obj);
+    if (issues.length) {
+      showLoadError('Het bestand voldoet niet aan het field-v1 schema.', issues);
+      return;
+    }
+
+    // Schema-versie waarschuwing (niet-blokkerend)
+    if (obj.schemaVersion !== EXPECTED_SCHEMA_VERSION) {
+      console.warn('[Field Player] schemaVersion mismatch: bestand=' + obj.schemaVersion +
+                   ', verwacht=' + EXPECTED_SCHEMA_VERSION + '. Doorgaan op eigen risico.');
+    }
+
+    // Plaats scenario onder een vaste 'custom'-key, zodat herladen oude versie vervangt
+    SCENARIOS['custom'] = obj;
+    transformLoaderCard(obj);
+    clearLoadError();
+  };
+  reader.readAsText(file);
+}
+
+/**
+ * Valideer scenario-object. Retourneert array met fout-meldingen (leeg = OK).
+ * Strikt op fundamentele structuur — alles waar de Player op crasht als het ontbreekt.
+ */
+function validateScenario(obj) {
+  const issues = [];
+  if (!obj || typeof obj !== 'object') {
+    return ['Bestand bevat geen scenario-object.'];
+  }
+
+  // Format & type
+  if (obj.scenarioFormat !== 'field-v1') {
+    issues.push('scenarioFormat moet "field-v1" zijn (gevonden: ' + JSON.stringify(obj.scenarioFormat) + ').');
+  }
+  if (!['procedural', 'incident'].includes(obj.scenarioType)) {
+    issues.push('scenarioType moet "procedural" of "incident" zijn (gevonden: ' + JSON.stringify(obj.scenarioType) + ').');
+  }
+
+  // Identificatie
+  if (!obj.id || typeof obj.id !== 'string')           issues.push('Verplicht veld "id" ontbreekt of is geen string.');
+  if (!obj.title || typeof obj.title !== 'string')     issues.push('Verplicht veld "title" ontbreekt of is geen string.');
+  if (typeof obj.organization !== 'string')            issues.push('Veld "organization" ontbreekt of is geen string.');
+  if (typeof obj.description !== 'string')             issues.push('Veld "description" ontbreekt of is geen string.');
+
+  // Briefing
+  if (!obj.briefing || typeof obj.briefing !== 'object') {
+    issues.push('Verplicht object "briefing" ontbreekt.');
+  } else if (typeof obj.briefing.dir !== 'string') {
+    issues.push('Veld "briefing.dir" ontbreekt of is geen string.');
+  }
+
+  // Participant
+  if (!obj.participant || typeof obj.participant !== 'object') {
+    issues.push('Verplicht object "participant" ontbreekt.');
+  } else if (!obj.participant.startLocationId) {
+    issues.push('Veld "participant.startLocationId" ontbreekt.');
+  }
+
+  // Locations
+  if (!Array.isArray(obj.locations) || obj.locations.length === 0) {
+    issues.push('Veld "locations" moet een niet-lege array zijn.');
+  } else {
+    obj.locations.forEach((loc, i) => {
+      if (!loc.id)    issues.push('locations[' + i + '].id ontbreekt.');
+      if (!loc.label) issues.push('locations[' + i + '].label ontbreekt.');
+    });
+    // startLocationId moet bestaan
+    if (obj.participant && obj.participant.startLocationId &&
+        !obj.locations.some(l => l.id === obj.participant.startLocationId)) {
+      issues.push('participant.startLocationId verwijst naar onbekende locatie "' +
+                  obj.participant.startLocationId + '".');
+    }
+  }
+
+  // Roles
+  if (!Array.isArray(obj.roles) || obj.roles.length === 0) {
+    issues.push('Veld "roles" moet een niet-lege array zijn.');
+  }
+
+  // Procedural-specifiek
+  if (obj.scenarioType === 'procedural') {
+    if (!obj.sop || typeof obj.sop !== 'object') {
+      issues.push('Procedural scenario: object "sop" ontbreekt.');
+    } else if (!Array.isArray(obj.sop.steps) || obj.sop.steps.length === 0) {
+      issues.push('Procedural scenario: "sop.steps" moet een niet-lege array zijn.');
+    }
+    if (!obj.assignment || typeof obj.assignment !== 'object') {
+      issues.push('Procedural scenario: object "assignment" ontbreekt.');
+    }
+  }
+
+  // Incident-specifiek
+  if (obj.scenarioType === 'incident') {
+    if (!obj.initialEvent || typeof obj.initialEvent !== 'object') {
+      issues.push('Incident scenario: object "initialEvent" ontbreekt.');
+    } else if (!obj.initialEvent.description) {
+      issues.push('Incident scenario: "initialEvent.description" ontbreekt.');
+    }
+    if (!Array.isArray(obj.expectedActions)) {
+      issues.push('Incident scenario: "expectedActions" moet een array zijn.');
+    }
+  }
+
+  return issues;
+}
+
+function transformLoaderCard(sc) {
+  const card = document.getElementById('loader-card');
+  if (!card) return;
+
+  const typeLabel = sc.scenarioType === 'incident' ? 'Incident' : 'Procedural';
+  const phases = sc.scenarioType === 'incident' ? '3 fasen' : '4 fasen';
+  const driver = sc.scenarioType === 'incident' ? 'Beoordelings-gedreven' : 'SOP-gedreven';
+  const diff   = sc.difficulty ? ('Difficulty ' + sc.difficulty) : 'Custom';
+
+  // Korte beschrijving — eerste zin van description, max ~180 tekens
+  let descShort = (sc.description || '').split(/(?<=[.!?])\s+/)[0] || sc.description || '';
+  if (descShort.length > 200) descShort = descShort.slice(0, 197) + '…';
+
+  // Escape voor veilige HTML-insertie
+  const esc = (s) => String(s || '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+
+  card.classList.remove('loader-empty');
+  card.classList.add('loader-filled');
+  card.onclick = () => chooseScenario('custom');
+  card.innerHTML = `
+    <button class="replace-btn" title="Ander bestand kiezen"
+            onclick="event.stopPropagation(); triggerCustomLoad();">↻</button>
+    <div class="type-badge custom">Eigen — ${esc(typeLabel)}</div>
+    <h3>${esc(sc.title)}</h3>
+    <p>${esc(descShort)}</p>
+    <div class="meta">
+      <span>${esc(phases)}</span><span>•</span><span>${esc(driver)}</span><span>•</span><span>${esc(diff)}</span>
+    </div>
+  `;
+}
+
+function showLoadError(headline, details) {
+  const box = document.getElementById('load-error');
+  if (!box) return;
+  let html = '<strong>' + headline + '</strong>';
+  if (details && details.length) {
+    html += '<ul>' + details.map(d => '<li>' + String(d).replace(/[<>]/g, '') + '</li>').join('') + '</ul>';
+  }
+  box.innerHTML = html;
+  box.classList.add('show');
+}
+
+function clearLoadError() {
+  const box = document.getElementById('load-error');
+  if (box) { box.classList.remove('show'); box.innerHTML = ''; }
 }
 
 function chooseScenario(id) {
