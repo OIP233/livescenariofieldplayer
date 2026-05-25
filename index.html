@@ -532,16 +532,15 @@ input, textarea {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 10px 5px 12px;
+  padding: 5px 12px;
   background: var(--green-bg);
   color: var(--green);
   border: 1px solid var(--green);
   border-radius: 4px;
   font-size: 13px;
-  cursor: pointer;
+  cursor: default;
   position: relative;
 }
-.location-pill:hover { background: #1a3e2a; }
 .location-pill .chevron { font-size: 10px; opacity: 0.7; }
 
 .location-dropdown {
@@ -2407,10 +2406,9 @@ input, textarea {
   <div class="top-bar">
     <div class="scenario-title" id="topbar-title">—</div>
     <div class="phase-pill" id="topbar-phase">Voorbereiding</div>
-    <div class="location-pill" id="topbar-location" onclick="toggleLocationDropdown(event)">
+    <div class="location-pill" id="topbar-location">
       <span>📍</span>
       <span id="topbar-location-label">—</span>
-      <span class="chevron">▾</span>
       <div class="location-dropdown" id="location-dropdown"></div>
     </div>
     <div class="spacer"></div>
@@ -2447,7 +2445,7 @@ input, textarea {
       <div id="storyline-wrap">
         <button id="expand-btn" onclick="expandStoryline()" title="Vergroot weergave">⤢</button>
         <button id="expand-close-btn" onclick="collapseStoryline()">✕&nbsp;&nbsp;Sluiten</button>
-        <iframe id="storyline-frame" sandbox="allow-scripts allow-same-origin allow-forms" allow="fullscreen" style="display:none"></iframe>
+        <iframe id="storyline-frame" allow="fullscreen" style="display:none"></iframe>
         <div id="storyline-placeholder">
           <div class="label">Veldzicht</div>
           <div class="loc-name" id="placeholder-loc">—</div>
@@ -6304,11 +6302,10 @@ function renderChannelSelector() {
 }
 
 function renderLocationDropdown() {
+  // v24: locatie volgt de fase; het dropdownmenu wordt niet meer gebruikt.
+  // Leeggemaakt zodat er geen klikbare locatie-opties in de DOM achterblijven.
   const dd = $('location-dropdown');
-  dd.innerHTML = getScenario().locations.map(l => `
-    <div class="opt ${l.id === STATE.currentLocationId ? 'current' : ''}" 
-         onclick="changeLocation('${l.id}')">${esc(l.label)}</div>
-  `).join('');
+  if (dd) dd.innerHTML = '';
 }
 
 function renderTopBar() {
@@ -6366,29 +6363,40 @@ function tryLoadStorylineSlide() {
                || loc.defaultSlideUrl;
   }
 
-  const frame = $('storyline-frame');
   const placeholder = $('storyline-placeholder');
-  if (slideUrl && slideUrl.startsWith('https://')) {
-    // Forceer een verse load: een iframe herlaadt niet betrouwbaar als
-    // frame.src op (vrijwel) dezelfde waarde wordt gezet. Eerst leegmaken,
-    // dan op de volgende tick de echte URL zetten.
-    if (STATE._loadedSlideUrl !== slideUrl) {
-      frame.src = 'about:blank';
-      // dubbele rAF zodat de browser de about:blank-reset echt verwerkt
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        frame.src = slideUrl;
-      }));
-      STATE._loadedSlideUrl = slideUrl;
-    }
-    frame.style.display = 'block';
+  const wantUrl = (slideUrl && slideUrl.startsWith('https://')) ? slideUrl : null;
+
+  // Niets te doen als de gevraagde slide al geladen is
+  if (wantUrl && STATE._loadedSlideUrl === wantUrl) return;
+
+  if (wantUrl) {
+    // Vervang het iframe-element volledig door een vers exemplaar.
+    // Een nieuw <iframe> met meteen de juiste src laadt schoon, zonder de
+    // origin-/contextverwarring die een about:blank-tussenstap bij een
+    // herlaad kan veroorzaken — Storyline-content krijgt zo betrouwbaar
+    // zijn volwaardige same-origin-context.
+    swapStorylineFrame(wantUrl);
+    STATE._loadedSlideUrl = wantUrl;
     placeholder.style.display = 'none';
   } else {
-    // Geen geldige https-URL (bv. placeholder-token of leeg): toon placeholder
-    frame.src = 'about:blank';
+    // Geen geldige https-URL (placeholder-token of leeg): leeg iframe, toon placeholder
+    swapStorylineFrame(null);
     STATE._loadedSlideUrl = null;
-    frame.style.display = 'none';
     placeholder.style.display = 'flex';
   }
+}
+
+// Bouwt een vers iframe-element op met hetzelfde id/styling en (optioneel) src.
+// Het oude element wordt vervangen, zodat er geen herlaad-artefacten optreden.
+function swapStorylineFrame(url) {
+  const old = $('storyline-frame');
+  if (!old) return;
+  const fresh = document.createElement('iframe');
+  fresh.id = 'storyline-frame';
+  fresh.setAttribute('allow', 'fullscreen');
+  fresh.style.display = url ? 'block' : 'none';
+  if (url) fresh.src = url;
+  old.parentNode.replaceChild(fresh, old);
 }
 
 function expandStoryline() {
@@ -6865,23 +6873,17 @@ function renderTabs() {
 }
 
 function toggleLocationDropdown(e) {
+  // v24: handmatige locatiekeuze is vergrendeld. De locatie volgt de fase
+  // (zie setPhase / getPhaseLocationId). De pill toont alleen nog waar de
+  // deelnemer zich bevindt; het dropdownmenu wordt niet meer geopend.
   e.stopPropagation();
-  $('location-dropdown').classList.toggle('open');
 }
-document.addEventListener('click', () => $('location-dropdown')?.classList.remove('open'));
 
 function changeLocation(locId) {
-  if (STATE.isPaused || STATE.scenarioEnded) return;
-  if (locId === STATE.currentLocationId) return;
-  const newLoc = getLocation(locId);
-  STATE.currentLocationId = locId;
-  STATE.envText = '';
-  renderTopBar();
-  renderLocationDropdown();
-  renderEnvironment();
-  tryLoadStorylineSlide();
-  addSystemMessage(`Je hebt je verplaatst naar: ${newLoc.label}`);
-  callClaude(`(deelnemer verplaatst zich naar locatie: ${newLoc.label})`);
+  // v24: locatiewissels lopen uitsluitend via de fase (setPhase). Een
+  // directe changeLocation-aanroep wordt genegeerd. Functie blijft bestaan
+  // voor compatibiliteit met eventuele oudere aanroepen.
+  console.warn('changeLocation genegeerd — locatie wordt door de fase bepaald:', locId);
 }
 
 function toggleAction(actionId) {
@@ -6952,10 +6954,38 @@ function confirmLMRA() {
   callClaude('(deelnemer heeft LMRA voltooid via het permit-paneel)');
 }
 
+// Leidt de locatie van een fase af uit de SOP-stappen van die fase:
+// de eerste stap met een ingevulde locationId bepaalt de locatie.
+// 'deviation' erft de locatie van 'execute' (afwijking speelt op dezelfde plek).
+function getPhaseLocationId(phase) {
+  const sc = getScenario();
+  const lookupPhase = (phase === 'deviation') ? 'execute' : phase;
+  const steps = (sc.sop?.steps || [])
+    .filter(s => s.phase === lookupPhase)
+    .sort((a, b) => (a.order || 0) - (b.order || 0));
+  const withLoc = steps.find(s => s.locationId);
+  return withLoc ? withLoc.locationId : null;
+}
+
 function setPhase(newPhase) {
   if (newPhase === STATE.currentPhase) return;
   STATE.currentPhase = newPhase;
+
+  // Locatie volgt de fase: verplaats de deelnemer naar de locatie die
+  // hoort bij de SOP-stappen van deze fase. Heeft de fase geen stap met
+  // een locationId, dan blijft de deelnemer waar hij is.
+  const phaseLocId = getPhaseLocationId(newPhase);
+  if (phaseLocId && phaseLocId !== STATE.currentLocationId && getLocation(phaseLocId)) {
+    STATE.currentLocationId = phaseLocId;
+  }
+
+  // Omgevingstekst resetten zodat de phaseDescriptions-tekst van de
+  // nieuwe fase/locatie weer in beeld komt (een eerdere AI-waarneming
+  // gold voor de vorige fase en mag niet blijven plakken).
+  STATE.envText = '';
+
   renderTopBar();
+  renderLocationDropdown();
   renderLeftPanel();
   renderEnvironment();
   tryLoadStorylineSlide();
