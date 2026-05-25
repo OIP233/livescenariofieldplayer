@@ -3049,6 +3049,7 @@ const STATE = {
   endHoldPoint: null,                   // hp object indien LSR-overtreding
   envText: '',                          // huidige omgevingstekst
   envInitialized: false,                // pas na eerste render mag flash effect
+  _loadedSlideUrl: null,                // URL die momenteel in storyline-iframe geladen is
   feedMessages: [],                     // {role, text, instructor: bool, channel}
   scenarioEndMs: 0,                     // tijdstip van scenario-einde — voor PDF/Excel
   debriefText: '',                      // gegenereerde debrief — bewaard voor export
@@ -4770,6 +4771,210 @@ function ambientCavitation() {
   };
 }
 
+function ambientOutdoorUnit() {
+  const ctx = AUDIO.ctx;
+  // Buiten op de unit: zachte wind + verre machinerie-bromtoon
+  const windSrc = ctx.createBufferSource();
+  windSrc.buffer = createNoiseBuffer(3);
+  windSrc.loop = true;
+  const windFilter = ctx.createBiquadFilter();
+  windFilter.type = 'lowpass';
+  windFilter.frequency.value = 420;
+  const windGain = ctx.createGain();
+  windGain.gain.value = 0.075;
+  windSrc.connect(windFilter).connect(windGain).connect(AUDIO.ambientGain);
+  windSrc.start();
+
+  // Trage LFO voor vlagerige wind
+  const lfo = ctx.createOscillator();
+  const lfoGain = ctx.createGain();
+  lfo.frequency.value = 0.12;
+  lfoGain.gain.value = 0.028;
+  lfo.connect(lfoGain).connect(windGain.gain);
+  lfo.start();
+
+  // Verre machinerie — lage bromtoon met lichte zweving
+  const hum = ctx.createOscillator();
+  hum.type = 'sine';
+  hum.frequency.value = 88;
+  const humGain = ctx.createGain();
+  humGain.gain.value = 0.035;
+  const hum2 = ctx.createOscillator();
+  hum2.type = 'sine';
+  hum2.frequency.value = 132;
+  const humGain2 = ctx.createGain();
+  humGain2.gain.value = 0.018;
+  hum.connect(humGain).connect(AUDIO.ambientGain);
+  hum2.connect(humGain2).connect(AUDIO.ambientGain);
+  hum.start();
+  hum2.start();
+
+  return () => {
+    windGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    humGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    humGain2.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    setTimeout(() => { try { windSrc.stop(); lfo.stop(); hum.stop(); hum2.stop(); } catch(e){} }, 600);
+  };
+}
+
+function ambientControlRoom() {
+  const ctx = AUDIO.ctx;
+  // Controlekamer: zachte HVAC-ruis, laag en breed
+  const hvacSrc = ctx.createBufferSource();
+  hvacSrc.buffer = createNoiseBuffer(3);
+  hvacSrc.loop = true;
+  const hvacFilter = ctx.createBiquadFilter();
+  hvacFilter.type = 'lowpass';
+  hvacFilter.frequency.value = 260;
+  const hvacGain = ctx.createGain();
+  hvacGain.gain.value = 0.06;
+  hvacSrc.connect(hvacFilter).connect(hvacGain).connect(AUDIO.ambientGain);
+  hvacSrc.start();
+
+  // Lichte elektrische bromtoon (50 Hz net-hum)
+  const hum = ctx.createOscillator();
+  hum.type = 'sine';
+  hum.frequency.value = 50;
+  const humGain = ctx.createGain();
+  humGain.gain.value = 0.022;
+  hum.connect(humGain).connect(AUDIO.ambientGain);
+  hum.start();
+
+  // Af en toe een zachte toetsklik
+  let clickTimer = null;
+  const scheduleClick = () => {
+    const delay = 2500 + Math.random() * 5000;
+    clickTimer = setTimeout(() => {
+      const src = ctx.createBufferSource();
+      src.buffer = createNoiseBuffer(0.06);
+      const f = ctx.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.value = 2400;
+      f.Q.value = 5;
+      const g = ctx.createGain();
+      const now = ctx.currentTime;
+      g.gain.setValueAtTime(0, now);
+      g.gain.linearRampToValueAtTime(0.05, now + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+      src.connect(f).connect(g).connect(AUDIO.ambientGain);
+      src.start(now);
+      src.stop(now + 0.08);
+      scheduleClick();
+    }, delay);
+  };
+  scheduleClick();
+
+  return () => {
+    if (clickTimer) clearTimeout(clickTimer);
+    hvacGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    humGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    setTimeout(() => { try { hvacSrc.stop(); hum.stop(); } catch(e){} }, 600);
+  };
+}
+
+function ambientAirRelease() {
+  const ctx = AUDIO.ctx;
+  // Persluchtontlasting: scherper, hoger gesis dan een vloeistoflek
+  const hissSrc = ctx.createBufferSource();
+  hissSrc.buffer = createNoiseBuffer(3);
+  hissSrc.loop = true;
+  const hissFilter = ctx.createBiquadFilter();
+  hissFilter.type = 'highpass';
+  hissFilter.frequency.value = 4200;
+  const hissGain = ctx.createGain();
+  hissGain.gain.value = 0.14;
+  hissSrc.connect(hissFilter).connect(hissGain).connect(AUDIO.ambientGain);
+  hissSrc.start();
+
+  // Tweede laag — bandpass voor "lichaam" in het gesis
+  const bodySrc = ctx.createBufferSource();
+  bodySrc.buffer = createNoiseBuffer(3);
+  bodySrc.loop = true;
+  const bodyFilter = ctx.createBiquadFilter();
+  bodyFilter.type = 'bandpass';
+  bodyFilter.frequency.value = 2200;
+  bodyFilter.Q.value = 2;
+  const bodyGain = ctx.createGain();
+  bodyGain.gain.value = 0.08;
+  bodySrc.connect(bodyFilter).connect(bodyGain).connect(AUDIO.ambientGain);
+  bodySrc.start();
+
+  // Trage zwelling — geeft het gesis een levend, pulserend karakter
+  const lfo = ctx.createOscillator();
+  const lfoGain = ctx.createGain();
+  lfo.frequency.value = 0.3;
+  lfoGain.gain.value = 0.03;
+  lfo.connect(lfoGain).connect(hissGain.gain);
+  lfo.start();
+
+  return () => {
+    hissGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    bodyGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    setTimeout(() => { try { hissSrc.stop(); bodySrc.stop(); lfo.stop(); } catch(e){} }, 600);
+  };
+}
+
+/* ─── v22: eigen ambient vanaf URL (kaal audiobestand op S3) ───
+   Een audiobestand wordt opgehaald, gedecodeerd tot ruwe AudioBuffer
+   en als loopende bron onder AUDIO.ambientGain gehangen — net als de
+   gesynthetiseerde ambients. Daarmee werkt mute-tijdens-opname, pauze,
+   fade en de volumeknop er automatisch op.
+   Decodeerde buffers worden gecachet zodat herhaald gebruik van
+   dezelfde URL niet opnieuw downloadt. */
+const AMBIENT_URL_CACHE = {};
+
+function ambientFromUrl(url) {
+  const ctx = AUDIO.ctx;
+  // Gain-node staat er meteen; bron wordt async aangehaakt zodra geladen.
+  const gain = ctx.createGain();
+  gain.gain.value = 0.0; // start stil, fade-in zodra buffer klaar is
+  gain.connect(AUDIO.ambientGain);
+
+  let srcNode = null;
+  let stopped = false;
+
+  const attachBuffer = (buffer) => {
+    if (stopped) return;
+    srcNode = ctx.createBufferSource();
+    srcNode.buffer = buffer;
+    srcNode.loop = true;
+    srcNode.connect(gain);
+    srcNode.start();
+    // zachte fade-in zodat de start niet "knipt"
+    gain.gain.cancelScheduledValues(ctx.currentTime);
+    gain.gain.setValueAtTime(0.0, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.6, ctx.currentTime + 0.6);
+  };
+
+  if (AMBIENT_URL_CACHE[url]) {
+    attachBuffer(AMBIENT_URL_CACHE[url]);
+  } else {
+    fetch(url, { mode: 'cors' })
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.arrayBuffer();
+      })
+      .then(data => ctx.decodeAudioData(data))
+      .then(buffer => {
+        AMBIENT_URL_CACHE[url] = buffer;
+        attachBuffer(buffer);
+      })
+      .catch(err => {
+        // Faalt stil: geen crash, geen ambient. Meestal CORS of een
+        // verkeerde URL. De gesynthetiseerde presets blijven werken.
+        console.warn('[Field Player] Ambient-URL kon niet geladen worden:', url, err);
+      });
+  }
+
+  return () => {
+    stopped = true;
+    try {
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+    } catch(e){}
+    setTimeout(() => { try { if (srcNode) srcNode.stop(); } catch(e){} }, 600);
+  };
+}
+
 // ─── Ambient manager ───
 function setAmbient(name) {
   if (!AUDIO.initialized) return;
@@ -4781,12 +4986,28 @@ function setAmbient(name) {
     AUDIO.ambientNodes = null;
   }
 
-  // Start nieuwe
+  if (!name) {
+    AUDIO.ambientName = null;
+    return;
+  }
+
+  // v22: een ambient-waarde kan óf een synthese-preset-id zijn óf een URL
+  // naar een kaal audiobestand (mp3/ogg) op S3. URL → eigen geluid laden.
+  if (typeof name === 'string' && /^https:\/\//.test(name)) {
+    AUDIO.ambientNodes = ambientFromUrl(name);
+    AUDIO.ambientName = name;
+    return;
+  }
+
+  // Anders: gesynthetiseerde preset
   const ambientMap = {
     'hiss-wind':      ambientHissAndWind,
     'hiss-heartbeat': ambientHissAndHeartbeat,
     'pump-room':      ambientPumpRoom,
     'cavitation':     ambientCavitation,
+    'outdoor-unit':   ambientOutdoorUnit,
+    'control-room':   ambientControlRoom,
+    'air-release':    ambientAirRelease,
   };
   const fn = ambientMap[name];
   if (fn) {
@@ -6141,17 +6362,30 @@ function tryLoadStorylineSlide() {
     slideUrl = sc.storylineUrls[STATE.currentPhase];
   } else {
     // Fallback / procedural: locatie-slide met optionele fase-override
-    slideUrl = (loc.phaseSlides && loc.phaseSlides[STATE.currentPhase]) 
+    slideUrl = (loc.phaseSlides && loc.phaseSlides[STATE.currentPhase])
                || loc.defaultSlideUrl;
   }
 
   const frame = $('storyline-frame');
   const placeholder = $('storyline-placeholder');
   if (slideUrl && slideUrl.startsWith('https://')) {
-    frame.src = slideUrl;
+    // Forceer een verse load: een iframe herlaadt niet betrouwbaar als
+    // frame.src op (vrijwel) dezelfde waarde wordt gezet. Eerst leegmaken,
+    // dan op de volgende tick de echte URL zetten.
+    if (STATE._loadedSlideUrl !== slideUrl) {
+      frame.src = 'about:blank';
+      // dubbele rAF zodat de browser de about:blank-reset echt verwerkt
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        frame.src = slideUrl;
+      }));
+      STATE._loadedSlideUrl = slideUrl;
+    }
     frame.style.display = 'block';
     placeholder.style.display = 'none';
   } else {
+    // Geen geldige https-URL (bv. placeholder-token of leeg): toon placeholder
+    frame.src = 'about:blank';
+    STATE._loadedSlideUrl = null;
     frame.style.display = 'none';
     placeholder.style.display = 'flex';
   }
