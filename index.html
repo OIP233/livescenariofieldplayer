@@ -3270,6 +3270,8 @@ const STATE = {
   debriefText: '',                      // platte-tekst samenvatting debrief — bewaard voor export
   debriefData: null,                    // gestructureerd debrief-object (JSON) — bewaard voor export
   _lastDebriefFromHP: false,            // onthoudt context voor 'opnieuw proberen'
+  deviationReached: false,              // true zodra de scenario-afwijking is opgetreden (deviation-fase)
+  phasesVisited: [],                    // chronologische lijst van bezochte fases
   // v18: pauze-state
   isPaused: false,                      // wordt true tijdens pauze
   pausedAtMs: 0,                        // tijdstip van pauze-start — om duur te berekenen
@@ -6296,7 +6298,14 @@ async function parseAndApplyAIResponse(reply) {
   }
 
   if (endMatch) {
-    setTimeout(() => endScenario('completed'), 1500);
+    // Het laatste bericht is nu volledig uitgetypt (de for-lus hierboven
+    // await't elke typewriter). Geef de deelnemer nog een leespauze die
+    // meeschaalt met de lengte van het slotbericht, zodat de overgang naar
+    // de debrief niet midden in het lezen valt.
+    const lastSeg = segments[segments.length - 1];
+    const lastLen = lastSeg ? (lastSeg.text || '').length : 0;
+    const readPause = Math.min(6000, Math.max(2600, lastLen * 28));
+    setTimeout(() => endScenario('completed'), readPause);
   }
 }
 
@@ -7009,6 +7018,8 @@ async function startScenario() {
   STATE.feedMessages = [];
   STATE.debriefData = null;
   STATE.debriefText = '';
+  STATE.deviationReached = false;
+  STATE.phasesVisited = [];
   STATE.firstActionTime = null;
   // v18: pauze-state opnieuw bij start (voor het geval scenario opnieuw start)
   STATE.isPaused = false;
@@ -7197,6 +7208,12 @@ function getPhaseLocationId(phase) {
 function setPhase(newPhase) {
   if (newPhase === STATE.currentPhase) return;
   STATE.currentPhase = newPhase;
+
+  // Fase-historie en afwijking-detectie bijhouden voor de debrief-evaluatie.
+  // Zodra de 'deviation'-fase wordt bereikt is de scenario-afwijking opgetreden;
+  // resterende uitvoeringsstappen kunnen dan legitiem niet meer worden afgerond.
+  (STATE.phasesVisited = STATE.phasesVisited || []).push(newPhase);
+  if (newPhase === 'deviation') STATE.deviationReached = true;
 
   // Locatie volgt de fase: verplaats de deelnemer naar de locatie die
   // hoort bij de SOP-stappen van deze fase. Heeft de fase geen stap met
@@ -7490,15 +7507,48 @@ function buildDebriefPrompt(fromHoldPoint) {
     }
   }
 
-  // Acties-overzicht
+  // Acties-overzicht — met afwijking-context.
+  // Bij een procedureel scenario zijn het de uitvoeringsstappen (_group:
+  // 'execute') die door een opgetreden afwijking geblokkeerd kunnen raken.
   const stats = getActionsStats();
+  const deviationReached = !!STATE.deviationReached;
+  let blockedCount = 0;
   const actionsList = stats.list.map(a => {
     const done = !!STATE.assignmentChecked[a.id];
     const meta = a.priority ? `[${a.priority}/${a.phase || ''}] ` : '';
-    return `  - ${meta}${a.action || a.label || a.id}: ${done ? 'WEL gedaan/gerapporteerd' : 'NIET gedaan/gerapporteerd'}`;
+    // Een niet-afgeronde UITVOERINGSstap, terwijl de afwijking al was
+    // opgetreden, is mogelijk geblokkeerd door die afwijking en mag niet
+    // zomaar negatief tellen. Voorbereidingsstappen vallen hier niet onder:
+    // die horen vóór de uitvoering te zijn afgerond.
+    const isExecuteStep = a._group === 'execute'
+      || a.phase === 'execute' || a.phase === 'act';
+    const blockedByDeviation = !done && deviationReached && isExecuteStep;
+    if (blockedByDeviation) blockedCount++;
+    const status = done
+      ? 'WEL gedaan/gerapporteerd'
+      : blockedByDeviation
+        ? 'NIET afgerond — mogelijk geblokkeerd door de opgetreden afwijking'
+        : 'NIET gedaan/gerapporteerd';
+    return `  - ${meta}${a.action || a.label || a.id}: ${status}`;
   }).join('\n') || '  (geen acties gedefinieerd)';
 
   let actionsBlock = `\n\nACTIE-OVERZICHT (${stats.done}/${stats.total} afgerond):\n${actionsList}`;
+
+  // Expliciete context over de afwijking — bepalend voor hoe onafgeronde
+  // uitvoeringsstappen beoordeeld moeten worden.
+  if (deviationReached) {
+    actionsBlock += `\n\nAFWIJKING-CONTEXT: tijdens dit scenario is de procesafwijking daadwerkelijk opgetreden`
+      + `${blockedCount > 0 ? ` en ${blockedCount} uitvoeringsstap(pen) ${blockedCount === 1 ? 'is' : 'zijn'} hierdoor niet meer afgerond` : ''}.`
+      + `\nBEOORDELINGSREGEL — LEES ZORGVULDIG:`
+      + `\n- Het is JUIST gedrag dat de deelnemer de normale uitvoering onderbreekt zodra de afwijking optreedt en overschakelt op het herkennen, melden en veiligstellen.`
+      + `\n- Uitvoeringsstappen die NIET zijn afgerond OMDAT de afwijking de normale uitvoering doorkruiste, mogen NIET negatief worden beoordeeld en mogen de score NIET drukken. Dit zijn geen gemiste stappen maar een logisch gevolg van correcte prioritering.`
+      + `\n- Benoem in de debrief wél feitelijk dat niet alle uitvoeringsstappen zijn doorlopen, maar vermeld er expliciet bij dat dit kwam doordat de afwijking optrad — neutraal, niet als tekortkoming.`
+      + `\n- Beoordeel WEL kritisch: hoe SNEL en ADEQUAAT herkende de deelnemer de afwijking, en handelde hij daarna correct (stoppen, melden, veiligstellen)? Daar ligt het echte leerpunt — niet bij de onafgemaakte routine-stappen.`
+      + `\n- Als de deelnemer ná het optreden van de afwijking gewoon doorging met routine-uitvoeringsstappen in plaats van te reageren, beoordeel DAT juist wél negatief.`;
+  } else {
+    actionsBlock += `\n\nAFWIJKING-CONTEXT: de procesafwijking is tijdens dit scenario niet (of niet als aparte fase) opgetreden. Onafgeronde uitvoeringsstappen mogen hier normaal beoordeeld worden.`;
+  }
+
   if (isIncident) {
     const logTxt = (STATE.actionLog || []).map(e => `  [${e.time}] ${e.text}`).join('\n')
                 || '  (deelnemer heeft niets in eigen actie-log gezet)';
@@ -7545,6 +7595,7 @@ INSTRUCTIES VOOR DE EVALUATIE — WEES KRITISCH:
 - Benoem concrete fouten bij naam, mét tijdstempel: "Op MM:SS deed/zei de deelnemer ...". Vermijd algemeenheden en vage complimenten.
 - Heeft de deelnemer weinig of niets gecommuniceerd? Benoem dat expliciet als serieus probleem — radiostilte bij een veldoperator is een tekortkoming, geen detail.
 - Beoordeel veldspecifieke punten kritisch: kwaliteit van LMRA/permit-check, herkennen van de afwijking, eigen veiligheid en line-of-fire, tijdige melding aan de CRO, en de eind-rapportage/hand-over.
+- ONAFGERONDE UITVOERINGSSTAPPEN: raadpleeg de AFWIJKING-CONTEXT bij het ACTIE-OVERZICHT. Reken uitvoeringsstappen die onafgerond bleven dóórdat de afwijking de normale uitvoering doorkruiste, NIET aan als tekortkoming en laat ze de competentie "Procedure-opvolging" en de eindscore niet drukken. Noem ze feitelijk en neutraal, met de afwijking als verklaring.
 - Schrijf feedback die de deelnemer iets leert — niet feedback die hem een goed gevoel geeft. Liever één scherp, bruikbaar verbeterpunt dan drie milde.
 - Verwijs in elk leerpunt naar een concreet moment uit het scenario.
 
@@ -8192,14 +8243,17 @@ function getExportLabels() {
 function getActionsStats() {
   // Voor incident: aantal expectedActions vs aantal gerapporteerd
   // Voor procedural: prep+execute acties vs voltooide
+  // Elke actie krijgt een _group-markering ('prep' | 'execute' | 'incident')
+  // zodat de debrief-evaluatie uitvoeringsstappen kan onderscheiden van
+  // voorbereidingsstappen — relevant voor de afwijking-context.
   const sc = getScenario();
   if (sc.scenarioType === 'incident') {
-    const ea = sc.expectedActions || [];
+    const ea = (sc.expectedActions || []).map(a => ({ ...a, _group: 'incident' }));
     const done = ea.filter(a => STATE.assignmentChecked[a.id]).length;
     return { done, total: ea.length, list: ea };
   } else {
-    const prep = (sc.assignment?.prepActions) || [];
-    const exec = (sc.assignment?.executeActions) || [];
+    const prep = ((sc.assignment?.prepActions) || []).map(a => ({ ...a, _group: 'prep' }));
+    const exec = ((sc.assignment?.executeActions) || []).map(a => ({ ...a, _group: 'execute' }));
     const all = [...prep, ...exec];
     const done = all.filter(a => STATE.assignmentChecked[a.id]).length;
     return { done, total: all.length, list: all };
