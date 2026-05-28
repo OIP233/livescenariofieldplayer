@@ -6368,8 +6368,8 @@ function renderSituatie() {
 
   $('tab-primary').innerHTML = `
     <div class="field-group">
-      <div class="field-label">Initiële situatie</div>
-      <div class="field-value" style="line-height:1.55">${esc(ie.description)}</div>
+      <div class="field-label">Situatie</div>
+      <div class="field-value" style="line-height:1.55">${esc(ie.participantCue && ie.participantCue.trim() ? ie.participantCue : 'Je neemt iets waar. Beoordeel de situatie.')}</div>
     </div>
     ${permitBlock}
 
@@ -6967,9 +6967,9 @@ function chooseScenario(id) {
   // Vul briefing
   $('briefing-title').textContent = sc.title;
   $('briefing-org').textContent = sc.organization;
-  $('briefing-description').textContent = sc.description + '\n\n' + sc.briefing.dir;
 
   if (sc.scenarioType === 'procedural') {
+    $('briefing-description').textContent = sc.description + '\n\n' + sc.briefing.dir;
     $('briefing-sop').textContent = sc.sop.title + ' (' + sc.sop.reference + '). ' + sc.sop.summary;
     $('briefing-sop-row').style.display = '';
     $('briefing-permit').textContent = sc.workPermit
@@ -6978,9 +6978,11 @@ function chooseScenario(id) {
     $('briefing-permit-row').style.display = '';
     $('briefing-event-row').style.display = 'none';
   } else {
-    // incident
-    $('briefing-event').textContent = sc.initialEvent.description;
-    $('briefing-event-row').style.display = '';
+    // incident — toon ALLEEN de briefing-tekst (neutrale context).
+    // De scenario-description en initialEvent verklappen het incident en worden
+    // bewust NIET getoond; de deelnemer moet zelf waarnemen.
+    $('briefing-description').textContent = sc.briefing.dir || '';
+    $('briefing-event-row').style.display = 'none';
     $('briefing-sop-row').style.display = 'none';
     $('briefing-permit-row').style.display = sc.workPermit ? '' : 'none';
     if (sc.workPermit) {
