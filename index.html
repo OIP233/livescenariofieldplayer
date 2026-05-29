@@ -5853,15 +5853,36 @@ ${refProc}`;
       .map(s => `  ${s.order}. [${s.id}] ${s.label} — ${s.instruction} (verwacht: ${s.expectedAction}${s.lsrTags.length ? '; LSR-relevantie: ' + s.lsrTags.join(', ') : ''})`)
       .join('\n');
 
+    const devEnabled = sc.deviation?.enabled !== false;
+    const phaseListText = devEnabled
+      ? `- prep      (Voorbereiding)
+- execute   (Uitvoering — SOP-stappen)
+- deviation (Afwijking — ontstaat door scenario-trigger)
+- secure    (Veiligstellen)`
+      : `- prep      (Voorbereiding)
+- execute   (Uitvoering — SOP-stappen)
+- secure    (Veiligstellen)
+
+LET OP: dit scenario heeft GEEN ingebouwde afwijking. De uitvoering verloopt rustig en procedureel. Stuur GEEN [FASE: deviation]. Beoordeel SOP-discipline, communicatie, en correct gebruik van werkpermit/LMRA.`;
+
+    const deviationBlock = devEnabled ? `
+
+═══════════════════════════════════════════════════════════
+INGEBOUWDE AFWIJKING
+═══════════════════════════════════════════════════════════
+Triggert: na stap ${sc.deviation.triggerAfterStepId}
+Wat gebeurt er technisch: ${sc.deviation.description}
+Hoe neemt deelnemer het waar: ${sc.deviation.onsetCue}
+Oorzaak: ${sc.deviation.rootCause}
+Correcte respons: ${sc.deviation.correctResponse}
+Veelgemaakte fouten: ${(sc.deviation.commonMistakes || []).join('; ')}` : '';
+
     trackSection = `
 ═══════════════════════════════════════════════════════════
 SCENARIO-TYPE: PROCEDURAL
 ═══════════════════════════════════════════════════════════
-Dit is een PROCEDURAL-scenario. De deelnemer voert een operationele activiteit uit volgens een SOP. Vier fases (in vaste volgorde):
-- prep      (Voorbereiding)
-- execute   (Uitvoering — SOP-stappen)
-- deviation (Afwijking — ontstaat door scenario-trigger)
-- secure    (Veiligstellen)
+Dit is een PROCEDURAL-scenario. De deelnemer voert een operationele activiteit uit volgens een SOP. Fases (in vaste volgorde):
+${phaseListText}
 
 ═══════════════════════════════════════════════════════════
 OPDRACHT — taakgerichte structuur (wat de deelnemer doet)
@@ -5892,17 +5913,7 @@ Uitvoering:
 ${groupSteps('execute')}
 
 Veiligstellen-procedure:
-${groupSteps('secure')}
-
-═══════════════════════════════════════════════════════════
-INGEBOUWDE AFWIJKING
-═══════════════════════════════════════════════════════════
-Triggert: na stap ${sc.deviation.triggerAfterStepId}
-Wat gebeurt er technisch: ${sc.deviation.description}
-Hoe neemt deelnemer het waar: ${sc.deviation.onsetCue}
-Oorzaak: ${sc.deviation.rootCause}
-Correcte respons: ${sc.deviation.correctResponse}
-Veelgemaakte fouten: ${sc.deviation.commonMistakes.join('; ')}`;
+${groupSteps('secure')}${deviationBlock}`;
   }
 
   // Instructeur-mode bepaalt hoeveel ruimte de instructeur krijgt
@@ -5976,7 +5987,9 @@ FASES EN PER-FASE RICHTLIJNEN
 ═══════════════════════════════════════════════════════════
 ${isIncident 
   ? 'Vaste volgorde: assess → act → report → einde'
-  : 'Vaste volgorde: prep → execute → deviation → secure → einde'
+  : (sc.deviation?.enabled !== false
+      ? 'Vaste volgorde: prep → execute → deviation → secure → einde'
+      : 'Vaste volgorde: prep → execute → secure → einde  (GEEN afwijking-fase in dit scenario)')
 }
 
 ${phaseConfigText}
@@ -7538,6 +7551,7 @@ function buildDebriefPrompt(fromHoldPoint) {
 
   // Expliciete context over de afwijking — bepalend voor hoe onafgeronde
   // uitvoeringsstappen beoordeeld moeten worden.
+  const devEnabledScenario = !isIncident && (sc.deviation?.enabled !== false);
   if (deviationReached) {
     actionsBlock += `\n\nAFWIJKING-CONTEXT: tijdens dit scenario is de procesafwijking daadwerkelijk opgetreden`
       + `${blockedCount > 0 ? ` en ${blockedCount} uitvoeringsstap(pen) ${blockedCount === 1 ? 'is' : 'zijn'} hierdoor niet meer afgerond` : ''}.`
@@ -7547,6 +7561,12 @@ function buildDebriefPrompt(fromHoldPoint) {
       + `\n- Benoem in de debrief wél feitelijk dat niet alle uitvoeringsstappen zijn doorlopen, maar vermeld er expliciet bij dat dit kwam doordat de afwijking optrad — neutraal, niet als tekortkoming.`
       + `\n- Beoordeel WEL kritisch: hoe SNEL en ADEQUAAT herkende de deelnemer de afwijking, en handelde hij daarna correct (stoppen, melden, veiligstellen)? Daar ligt het echte leerpunt — niet bij de onafgemaakte routine-stappen.`
       + `\n- Als de deelnemer ná het optreden van de afwijking gewoon doorging met routine-uitvoeringsstappen in plaats van te reageren, beoordeel DAT juist wél negatief.`;
+  } else if (!isIncident && !devEnabledScenario) {
+    actionsBlock += `\n\nAFWIJKING-CONTEXT: dit scenario heeft GEEN ingebouwde afwijking — pure SOP-uitvoering. Beoordeel daarom:`
+      + `\n- SOP-discipline: zijn alle uitvoeringsstappen correct en in de juiste volgorde doorlopen?`
+      + `\n- Communicatie: helder en tijdig?`
+      + `\n- LMRA en werkpermit: correct gebruikt waar van toepassing?`
+      + `\n- Het ontbreken van een afwijking is hier geen tekortkoming maar een ontwerp-keuze (basisroutine inoefenen).`;
   } else {
     actionsBlock += `\n\nAFWIJKING-CONTEXT: de procesafwijking is tijdens dit scenario niet (of niet als aparte fase) opgetreden. Onafgeronde uitvoeringsstappen mogen hier normaal beoordeeld worden.`;
   }
