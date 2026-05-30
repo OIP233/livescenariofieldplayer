@@ -5792,6 +5792,44 @@ function buildSystemPrompt() {
   const phaseConfigText = Object.entries(sc.phaseConfig || {})
     .map(([k,v]) => `- ${k}: ${v.dir}`).join('\n');
 
+  // ─── Observable signals (omgevingssignalen, statisch per locatie+fase) ───
+  // De deelnemer ziet deze in de Situatie-tab zonder labels; de AI krijgt
+  // ze MET significantie zodat hij gedrag kan sturen en zelf kan registreren
+  // of de deelnemer ze adresseert.
+  const signals = sc.observableSignals || [];
+  let signalsSection = '';
+  if (signals.length > 0) {
+    const sigByLoc = {};
+    signals.forEach(s => {
+      const k = s.locationId || '(geen locatie)';
+      (sigByLoc[k] = sigByLoc[k] || []).push(s);
+    });
+    const formatSig = (s) => {
+      const sig = (s.significance || 'notable').toUpperCase();
+      return `    - [${sig}] fase ${s.phase} — "${s.description}"
+       Verwachte respons: ${s.expectedResponse || '(geen — bij distractor: niets doen of kort verifiëren)'}`;
+    };
+    const sigBlocks = Object.entries(sigByLoc).map(([locId, list]) => {
+      const loc = sc.locations.find(l => l.id === locId);
+      const locLabel = loc ? `${loc.label} (${locId})` : locId;
+      return `  Op locatie ${locLabel}:\n${list.map(formatSig).join('\n')}`;
+    }).join('\n\n');
+    signalsSection = `
+
+═══════════════════════════════════════════════════════════
+OMGEVINGSSIGNALEN — statische waarnemingen per locatie+fase
+═══════════════════════════════════════════════════════════
+De deelnemer ziet deze signalen automatisch in de Situatie-tab zodra hij op de juiste locatie/fase is. Hij ziet ze ZONDER significantie-labels — hij moet zelf inschatten wat belangrijk is.
+
+${sigBlocks}
+
+GEDRAGSREGELS:
+- SIGNIFICANT signalen MOETEN opgemerkt en geadresseerd worden. Als de deelnemer er na enige tijd niets mee doet, mogen NPC-rollen (collega, supervisor) een SUBTIELE hint geven door zelf een vraag te stellen ("valt jou iets op rond ...?" of "hoe ziet het er bij ... uit?"). NOOIT het signaal bij naam noemen, NOOIT de juiste actie verklappen. Eén hint per signaal; als de deelnemer dan nog niets oppakt is het een leerpunt voor de debrief.
+- NOTABLE signalen verdienen genoemd te worden maar zijn niet kritiek. Geen actieve hints; alleen positief in debrief als opgepakt.
+- DISTRACTOR signalen zijn afleiders. Negeren door deelnemer = correct gedrag. Wel kort melden of vragen = ook prima. Veel tijd of zorg er aan besteden = leerpunt over prioritering.
+- Wanneer de deelnemer EEN signaal expliciet benoemt of er actie op onderneemt, registreer dat impliciet door de rol-respons (CRO bevestigt ontvangst, supervisor reageert proportioneel). De debrief krijgt het volledige verloop te zien.`;
+  }
+
   // ─── Track-specifieke prompt-secties ───
   let trackSection;
   if (isIncident) {
@@ -6004,6 +6042,7 @@ LOCATIES
 ${locationsList}
 
 De deelnemer kan tussen locaties wisselen. Je krijgt elke beurt de huidige locatie in het [STATUS]-blok. Reageer context-bewust: beschrijf niet wat elders gebeurt. Mag actief naar een andere locatie sturen.
+${signalsSection}
 
 ═══════════════════════════════════════════════════════════
 HOLD-POINTS — scenario-beëindigende overtredingen
@@ -6337,6 +6376,29 @@ function renderLeftPanel() {
 }
 
 // INCIDENT — Situatie-tab
+/**
+ * Render the participant's optional action-log block.
+ * Shared between procedural Opdracht tab and incident Situatie tab.
+ */
+function renderActionLogBlock() {
+  const sc = getScenario();
+  const log = sc.participantActionLog;
+  if (!log || log.enabled === false) return '';
+  return `
+    <div class="field-group">
+      <div class="field-label">Eigen actie-log</div>
+      <div class="action-log">
+        ${(STATE.actionLog || []).map(entry =>
+          `<div class="log-entry"><span class="log-time">${esc(entry.time)}</span> ${esc(entry.text)}</div>`
+        ).join('') || '<div class="log-empty">Nog geen acties gelogd.</div>'}
+        <div class="log-input-row">
+          <input type="text" id="action-log-input" placeholder="${esc(log.placeholder || 'Actie...')}" onkeydown="if(event.key==='Enter'){addActionLog();}">
+          <button onclick="addActionLog()">+</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function renderSituatie() {
   const sc = getScenario();
   const ie = sc.initialEvent;
@@ -6363,21 +6425,7 @@ function renderSituatie() {
   ` : '';
 
   // Eigen actie-log
-  const log = sc.participantActionLog;
-  const logBlock = (log && log.enabled) ? `
-    <div class="field-group">
-      <div class="field-label">Eigen actie-log</div>
-      <div class="action-log">
-        ${(STATE.actionLog || []).map(entry => 
-          `<div class="log-entry"><span class="log-time">${esc(entry.time)}</span> ${esc(entry.text)}</div>`
-        ).join('') || '<div class="log-empty">Nog geen acties gelogd.</div>'}
-        <div class="log-input-row">
-          <input type="text" id="action-log-input" placeholder="${esc(log.placeholder || 'Actie...')}" onkeydown="if(event.key==='Enter'){addActionLog();}">
-          <button onclick="addActionLog()">+</button>
-        </div>
-      </div>
-    </div>
-  ` : '';
+  const logBlock = renderActionLogBlock();
 
   $('tab-primary').innerHTML = `
     <div class="field-group">
@@ -6499,6 +6547,8 @@ function renderOpdracht() {
     ${executeActionsHtml}
 
     ${secureBlock}
+
+    ${renderActionLogBlock()}
   `;
 }
 
@@ -6561,16 +6611,52 @@ function renderTopBar() {
 }
 
 function renderEnvironment() {
+  const sc = getScenario();
   const loc = getCurrentLocation();
   let text = STATE.envText;
   if (!text) {
-    text = (loc.phaseDescriptions && loc.phaseDescriptions[STATE.currentPhase]) 
+    text = (loc.phaseDescriptions && loc.phaseDescriptions[STATE.currentPhase])
            || loc.description;
   }
+
+  // Signalen die nu zichtbaar zijn: matching op huidige fase EN locatie
+  const matchingSignals = (sc.observableSignals || []).filter(s =>
+    s.phase === STATE.currentPhase && s.locationId === STATE.currentLocationId
+  );
+
   const contentEl = $('environment-content');
   const oldText = contentEl.textContent;
-  contentEl.textContent = text;
-  if (STATE.envInitialized && text !== oldText) flashEnvironment();
+  const oldHadSignals = contentEl.dataset.hadSignals === 'true';
+
+  // Bouw inhoud: basis-waarneming gevolgd door signalen-lijst (indien aanwezig).
+  // Bewust GEEN visueel onderscheid tussen significant/notable/distractor —
+  // de deelnemer moet zelf het belang inschatten. We mengen ze gewoon in de
+  // volgorde waarin de auteur ze heeft gedefinieerd.
+  if (matchingSignals.length > 0) {
+    const items = matchingSignals.map(s =>
+      `<li style="margin-top:4px">${escHtml(s.description)}</li>`
+    ).join('');
+    contentEl.innerHTML = `${escHtml(text)}<ul style="margin:8px 0 0 0;padding-left:20px;color:var(--text);font-size:12.5px">${items}</ul>`;
+    contentEl.dataset.hadSignals = 'true';
+  } else {
+    contentEl.textContent = text;
+    contentEl.dataset.hadSignals = 'false';
+  }
+
+  const newText = contentEl.textContent; // werkt voor beide takken
+  if (STATE.envInitialized && (newText !== oldText || oldHadSignals !== (matchingSignals.length > 0))) {
+    flashEnvironment();
+  }
+}
+
+// Lokaal helper-tje om HTML te escapen — gebruikt door renderEnvironment.
+// De bestaande esc() wordt al gebruikt voor textContent; voor innerHTML
+// hebben we expliciet HTML-veilige output nodig.
+function escHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function updateEnvironment(text, sense) {
@@ -7571,10 +7657,33 @@ function buildDebriefPrompt(fromHoldPoint) {
     actionsBlock += `\n\nAFWIJKING-CONTEXT: de procesafwijking is tijdens dit scenario niet (of niet als aparte fase) opgetreden. Onafgeronde uitvoeringsstappen mogen hier normaal beoordeeld worden.`;
   }
 
-  if (isIncident) {
+  // Actielog — beschikbaar voor beide scenariotypes als ingeschakeld
+  if (sc.participantActionLog?.enabled !== false) {
     const logTxt = (STATE.actionLog || []).map(e => `  [${e.time}] ${e.text}`).join('\n')
                 || '  (deelnemer heeft niets in eigen actie-log gezet)';
     actionsBlock += `\n\nEIGEN ACTIE-LOG VAN DEELNEMER:\n${logTxt}`;
+  }
+
+  // Omgevingssignalen — beoordeling op pickup
+  const sigList = sc.observableSignals || [];
+  if (sigList.length > 0) {
+    const sigEntries = sigList.map(s => {
+      const loc = sc.locations.find(l => l.id === s.locationId);
+      const locLabel = loc ? loc.label : (s.locationId || '?');
+      const sig = (s.significance || 'notable').toUpperCase();
+      return `  - [${sig}] (locatie ${locLabel}, fase ${s.phase}): "${s.description}"
+       Verwachte respons: ${s.expectedResponse || '(geen — distractor)'}`;
+    }).join('\n');
+    actionsBlock += `\n\nOMGEVINGSSIGNALEN — beoordeling van waarnemingsvermogen:
+${sigEntries}
+
+BEOORDELINGSREGEL:
+- Lees het transcript en de eigen actielog terug en bepaal per signaal: is het OPGEMERKT (deelnemer benoemt het), OPGEPAKT (deelnemer onderneemt actie zoals melden of onderzoeken), of GEMIST?
+- Een gemist SIGNIFICANT signaal is een belangrijk leerpunt — benoem het expliciet in de debrief: WAT er was, WAAROM het belangrijk was, en wat WEL had gemoeten.
+- Een opgepakt SIGNIFICANT of NOTABLE signaal is een positieve waarneming — benoem het kort als gunstig.
+- Een DISTRACTOR die genegeerd werd: kort positief benoemen als blijk van prioritering.
+- Een DISTRACTOR waar veel tijd of zorg aan besteed werd: benoem als leerpunt over prioritering — energie ging naar het verkeerde.
+- Wees feitelijk en concreet: citeer kort uit transcript/log waar mogelijk om aan te tonen wat de deelnemer wel/niet zei.`;
   }
 
   // Hold-point
